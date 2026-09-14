@@ -35,6 +35,7 @@ import {
   handleRecruitCommand,
   handleRecruitSetupButton,
   handleRecruitSetupModal,
+  handleRecruitSetupSelect,
   isRecruitButton,
   isRecruitSetupComponent,
   recruitCommand,
@@ -173,6 +174,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.isButton() && isRankingButton(interaction.customId)) {
         await handleRankingButton(interaction);
+        return;
+      }
+      if (
+        interaction.isStringSelectMenu() &&
+        isRecruitSetupComponent(interaction.customId)
+      ) {
+        await handleRecruitSetupSelect(interaction);
         return;
       }
       if (

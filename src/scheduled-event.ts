@@ -13,21 +13,27 @@ import {
   ModalSubmitInteraction,
   PermissionFlagsBits,
   SlashCommandBuilder,
+  StringSelectMenuBuilder,
+  StringSelectMenuInteraction,
   TextInputBuilder,
   TextInputStyle,
 } from "discord.js";
 import { createLobby } from "./game";
 
-const DEFAULT_TARGET_PLAYER_COUNT = 8;
+const DEFAULT_TARGET_PLAYER_COUNT = 7;
 const MAX_PLAYER_COUNT = 15;
 const EVENT_DURATION_MS = 2 * 60 * 60 * 1000;
 const RECRUIT_BUTTON_PREFIX = "tb-recruit:start:";
 const RECRUIT_SETUP_PREFIX = "tb-recruit:setup:";
 const RECRUIT_SETUP_TTL_MS = 30 * 60 * 1000;
 const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
+const DATE_OPTION_DAYS = 25;
+const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"] as const;
 
 type RecruitSetupAction =
-  | "datetime"
+  | "date"
+  | "hour"
+  | "minute"
   | "players"
   | "name"
   | "create"
@@ -40,7 +46,7 @@ interface RecruitSetupSession {
   channelId: string;
   eventName: string;
   targetPlayerCount: number;
-  startAt?: Date;
+  startAt: Date;
   createdAt: number;
 }
 
@@ -227,7 +233,9 @@ function parseSetupCustomId(
 
   if (rest.length || !/^[a-z0-9]+$/i.test(sessionId ?? "")) return undefined;
   if (
-    action !== "datetime" &&
+    action !== "date" &&
+    action !== "hour" &&
+    action !== "minute" &&
     action !== "players" &&
     action !== "name" &&
     action !== "create" &&
@@ -259,70 +267,146 @@ function getSetupSession(sessionId: string): RecruitSetupSession | undefined {
   return session;
 }
 
-function setupPanel(session: RecruitSetupSession): {
-  embeds: EmbedBuilder[];
-  components: ActionRowBuilder<ButtonBuilder>[];
-} {
-  const startText = session.startAt
-    ? `<t:${Math.floor(session.startAt.getTime() / 1000)}:F>（<t:${Math.floor(session.startAt.getTime() / 1000)}:R>）`
-    : "**未設定**";
+function defaultRecruitStartAt(now = new Date()): Date {
+  const parts = jstParts(now);
+  let candidate = makeJstDate(parts.year, parts.month, parts.day, 21, 0);
+  if (candidate && candidate.getTime() > now.getTime() + 2 * 60_000) {
+    return candidate;
+  }
+
+  const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  const tomorrowParts = jstParts(tomorrow);
+  candidate = makeJstDate(
+    tomorrowParts.year,
+    tomorrowParts.month,
+    tomorrowParts.day,
+    21,
+    0,
+  );
+  if (!candidate) throw new Error("Could not build default recruitment time");
+  return candidate;
+}
+
+function sameJstDate(a: Date, b: Date): boolean {
+  const first = jstParts(a);
+  const second = jstParts(b);
+  return (
+    first.year === second.year &&
+    first.month === second.month &&
+    first.day === second.day
+  );
+}
+
+function dateOptions(startAt: Date, now = new Date()) {
+  const today = jstParts(now);
+  return Array.from({ length: DATE_OPTION_DAYS }, (_, offset) => {
+    const normalized = new Date(
+      Date.UTC(today.year, today.month - 1, today.day + offset),
+    );
+    const year = normalized.getUTCFullYear();
+    const month = normalized.getUTCMonth() + 1;
+    const day = normalized.getUTCDate();
+    const value = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    const prefix = offset === 0 ? "今日 " : offset === 1 ? "明日 " : "";
+    const label = `${prefix}${month}/${day}(${WEEKDAYS[normalized.getUTCDay()]})`;
+    const optionDate = makeJstDate(year, month, day, 12, 0);
+
+    return {
+      label,
+      value,
+      default: optionDate ? sameJstDate(optionDate, startAt) : false,
+    };
+  });
+}
+
+function setupPanel(session: RecruitSetupSession) {
+  const parts = jstParts(session.startAt);
+  const unix = Math.floor(session.startAt.getTime() / 1000);
 
   const embed = new EmbedBuilder()
     .setTitle("人狼募集の設定")
     .setDescription(
       [
-        `📅 開始日時：${startText}`,
+        `📅 開始日時：<t:${unix}:F>（<t:${unix}:R>）`,
         `👥 募集人数：**${session.targetPlayerCount}人**`,
         `📝 タイトル：**${session.eventName}**`,
         "",
-        "必要な項目を変更して、最後に「募集開始」を押してください。",
+        "日付・時刻・人数は下のメニューから選べます。",
+        "そのままでよければ「募集開始」を押すだけです。",
       ].join("\n"),
     )
     .setColor(0x5865f2)
     .setFooter({
-      text: "日時は日本時間（JST）として扱います・設定は30分で期限切れ",
+      text: "日時は日本時間（JST）・初期時刻は次の21:00・設定は30分で期限切れ",
     });
 
-  const settingsRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(setupCustomId(session.id, "datetime"))
-      .setLabel("日時を設定")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
+  const dateRow = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(setupCustomId(session.id, "date"))
+      .setPlaceholder("開始日を選ぶ")
+      .addOptions(...dateOptions(session.startAt)),
+  );
+
+  const hourRow = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(setupCustomId(session.id, "hour"))
+      .setPlaceholder("開始時刻（時）")
+      .addOptions(
+        ...Array.from({ length: 24 }, (_, hour) => ({
+          label: `${String(hour).padStart(2, "0")}時`,
+          value: String(hour),
+          default: hour === parts.hour,
+        })),
+      ),
+  );
+
+  const minuteRow = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(setupCustomId(session.id, "minute"))
+      .setPlaceholder("開始時刻（分）")
+      .addOptions(
+        ...Array.from({ length: 12 }, (_, index) => index * 5).map((minute) => ({
+          label: `${String(minute).padStart(2, "0")}分`,
+          value: String(minute),
+          default: minute === parts.minute,
+        })),
+      ),
+  );
+
+  const playersRow = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+    new StringSelectMenuBuilder()
       .setCustomId(setupCustomId(session.id, "players"))
-      .setLabel("人数を設定")
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId(setupCustomId(session.id, "name"))
-      .setLabel("タイトルを設定")
-      .setStyle(ButtonStyle.Secondary),
+      .setPlaceholder("募集人数を選ぶ")
+      .addOptions(
+        ...Array.from({ length: MAX_PLAYER_COUNT - 3 }, (_, index) => index + 4).map(
+          (players) => ({
+            label: `${players}人`,
+            value: String(players),
+            default: players === session.targetPlayerCount,
+          }),
+        ),
+      ),
   );
 
   const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
+      .setCustomId(setupCustomId(session.id, "name"))
+      .setLabel("タイトル変更")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
       .setCustomId(setupCustomId(session.id, "create"))
       .setLabel("募集開始")
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(!session.startAt),
+      .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId(setupCustomId(session.id, "cancel"))
       .setLabel("キャンセル")
       .setStyle(ButtonStyle.Danger),
   );
 
-  return { embeds: [embed], components: [settingsRow, actionRow] };
-}
-
-function dateInputValue(date: Date | undefined): string | undefined {
-  if (!date) return undefined;
-  const { year, month, day } = jstParts(date);
-  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-}
-
-function timeInputValue(date: Date | undefined): string | undefined {
-  if (!date) return undefined;
-  const { hour, minute } = jstParts(date);
-  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+  return {
+    embeds: [embed],
+    components: [dateRow, hourRow, minuteRow, playersRow, actionRow],
+  };
 }
 
 function discordEventUrl(guildId: string, eventId: string): string {
@@ -376,6 +460,22 @@ function recruitmentMessage(
   return { embeds: [embed], components: [row] };
 }
 
+function setupSessionForInteraction(
+  customId: string,
+  userId: string,
+  guildId: string | null,
+): { parsed: { sessionId: string; action: RecruitSetupAction }; session: RecruitSetupSession } | undefined {
+  const parsed = parseSetupCustomId(customId);
+  if (!parsed) return undefined;
+
+  const session = getSetupSession(parsed.sessionId);
+  if (!session || userId !== session.hostId || guildId !== session.guildId) {
+    return undefined;
+  }
+
+  return { parsed, session };
+}
+
 export async function handleRecruitCommand(
   interaction: ChatInputCommandInteraction,
 ): Promise<void> {
@@ -420,6 +520,7 @@ export async function handleRecruitCommand(
     channelId: interaction.channelId,
     eventName: "人狼ゲーム",
     targetPlayerCount: DEFAULT_TARGET_PLAYER_COUNT,
+    startAt: defaultRecruitStartAt(),
     createdAt: Date.now(),
   };
   recruitSetupSessions.set(session.id, session);
@@ -427,18 +528,15 @@ export async function handleRecruitCommand(
   await interaction.reply({ ...setupPanel(session), ephemeral: true });
 }
 
-export async function handleRecruitSetupButton(
-  interaction: ButtonInteraction,
+export async function handleRecruitSetupSelect(
+  interaction: StringSelectMenuInteraction,
 ): Promise<void> {
-  const parsed = parseSetupCustomId(interaction.customId);
-  if (!parsed) return;
-
-  const session = getSetupSession(parsed.sessionId);
-  if (
-    !session ||
-    interaction.user.id !== session.hostId ||
-    interaction.guildId !== session.guildId
-  ) {
+  const state = setupSessionForInteraction(
+    interaction.customId,
+    interaction.user.id,
+    interaction.guildId,
+  );
+  if (!state) {
     await interaction.reply({
       content:
         "この募集設定は期限切れです。もう一度 `/recruit` を実行してください。",
@@ -447,53 +545,88 @@ export async function handleRecruitSetupButton(
     return;
   }
 
-  if (parsed.action === "datetime") {
-    const dateInput = new TextInputBuilder()
-      .setCustomId("recruit-date")
-      .setLabel("開始日（例: 9/20 または 2026-09-20）")
-      .setStyle(TextInputStyle.Short)
-      .setRequired(true)
-      .setPlaceholder("9/20");
-    const dateValue = dateInputValue(session.startAt);
-    if (dateValue) dateInput.setValue(dateValue);
+  const { parsed, session } = state;
+  const selected = interaction.values[0];
+  if (!selected) return;
+  const current = jstParts(session.startAt);
+  let nextStartAt: Date | undefined;
 
-    const timeInput = new TextInputBuilder()
-      .setCustomId("recruit-time")
-      .setLabel("開始時刻（例: 21:00）")
-      .setStyle(TextInputStyle.Short)
-      .setRequired(true)
-      .setPlaceholder("21:00");
-    const timeValue = timeInputValue(session.startAt);
-    if (timeValue) timeInput.setValue(timeValue);
-
-    const modal = new ModalBuilder()
-      .setCustomId(setupCustomId(session.id, "datetime"))
-      .setTitle("開始日時を設定")
-      .addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(dateInput),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(timeInput),
-      );
-
-    await interaction.showModal(modal);
+  if (parsed.action === "date") {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(selected);
+    if (!match) return;
+    nextStartAt = makeJstDate(
+      Number(match[1]),
+      Number(match[2]),
+      Number(match[3]),
+      current.hour,
+      current.minute,
+    );
+  } else if (parsed.action === "hour") {
+    const hour = Number(selected);
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23) return;
+    nextStartAt = makeJstDate(
+      current.year,
+      current.month,
+      current.day,
+      hour,
+      current.minute,
+    );
+  } else if (parsed.action === "minute") {
+    const minute = Number(selected);
+    if (!Number.isInteger(minute) || minute < 0 || minute > 59) return;
+    nextStartAt = makeJstDate(
+      current.year,
+      current.month,
+      current.day,
+      current.hour,
+      minute,
+    );
+  } else if (parsed.action === "players") {
+    const players = Number(selected);
+    if (
+      !Number.isInteger(players) ||
+      players < 4 ||
+      players > MAX_PLAYER_COUNT
+    ) {
+      return;
+    }
+    session.targetPlayerCount = players;
+    await interaction.update(setupPanel(session));
+    return;
+  } else {
     return;
   }
 
-  if (parsed.action === "players") {
-    const input = new TextInputBuilder()
-      .setCustomId("recruit-players")
-      .setLabel(`募集人数（4〜${MAX_PLAYER_COUNT}）`)
-      .setStyle(TextInputStyle.Short)
-      .setRequired(true)
-      .setValue(String(session.targetPlayerCount));
-
-    const modal = new ModalBuilder()
-      .setCustomId(setupCustomId(session.id, "players"))
-      .setTitle("募集人数を設定")
-      .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
-
-    await interaction.showModal(modal);
+  if (!nextStartAt || nextStartAt.getTime() <= Date.now()) {
+    await interaction.reply({
+      content: "その開始日時は過去です。現在より後の日時を選んでください。",
+      ephemeral: true,
+    });
     return;
   }
+
+  session.startAt = nextStartAt;
+  await interaction.update(setupPanel(session));
+}
+
+export async function handleRecruitSetupButton(
+  interaction: ButtonInteraction,
+): Promise<void> {
+  const state = setupSessionForInteraction(
+    interaction.customId,
+    interaction.user.id,
+    interaction.guildId,
+  );
+  if (!state) {
+    await interaction.reply({
+      content:
+        "この募集設定は期限切れです。もう一度 `/recruit` を実行してください。",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const { parsed, session } = state;
 
   if (parsed.action === "name") {
     const input = new TextInputBuilder()
@@ -525,9 +658,9 @@ export async function handleRecruitSetupButton(
 
   if (parsed.action !== "create") return;
 
-  if (!session.startAt) {
+  if (session.startAt.getTime() <= Date.now()) {
     await interaction.reply({
-      content: "先に開始日時を設定してください。",
+      content: "開始日時が過ぎています。日時を選び直してください。",
       ephemeral: true,
     });
     return;
@@ -617,15 +750,12 @@ export async function handleRecruitSetupButton(
 export async function handleRecruitSetupModal(
   interaction: ModalSubmitInteraction,
 ): Promise<void> {
-  const parsed = parseSetupCustomId(interaction.customId);
-  if (!parsed) return;
-
-  const session = getSetupSession(parsed.sessionId);
-  if (
-    !session ||
-    interaction.user.id !== session.hostId ||
-    interaction.guildId !== session.guildId
-  ) {
+  const state = setupSessionForInteraction(
+    interaction.customId,
+    interaction.user.id,
+    interaction.guildId,
+  );
+  if (!state) {
     await interaction.reply({
       content:
         "この募集設定は期限切れです。もう一度 `/recruit` を実行してください。",
@@ -633,6 +763,9 @@ export async function handleRecruitSetupModal(
     });
     return;
   }
+
+  const { parsed, session } = state;
+  if (parsed.action !== "name") return;
 
   if (!interaction.isFromMessage()) {
     await interaction.reply({
@@ -642,58 +775,17 @@ export async function handleRecruitSetupModal(
     return;
   }
 
-  if (parsed.action === "datetime") {
-    const result = parseRecruitStartAt(
-      interaction.fields.getTextInputValue("recruit-date"),
-      interaction.fields.getTextInputValue("recruit-time"),
-    );
-
-    if (!result.ok) {
-      await interaction.reply({ content: result.error, ephemeral: true });
-      return;
-    }
-
-    session.startAt = result.value;
-    await interaction.update(setupPanel(session));
+  const value = interaction.fields.getTextInputValue("recruit-name").trim();
+  if (!value || value.length > 80) {
+    await interaction.reply({
+      content: "タイトルは1〜80文字で入力してください。",
+      ephemeral: true,
+    });
     return;
   }
 
-  if (parsed.action === "players") {
-    const value = Number(
-      normaliseInput(interaction.fields.getTextInputValue("recruit-players")),
-    );
-
-    if (
-      !Number.isInteger(value) ||
-      value < 4 ||
-      value > MAX_PLAYER_COUNT
-    ) {
-      await interaction.reply({
-        content: `募集人数は4〜${MAX_PLAYER_COUNT}の整数で入力してください。`,
-        ephemeral: true,
-      });
-      return;
-    }
-
-    session.targetPlayerCount = value;
-    await interaction.update(setupPanel(session));
-    return;
-  }
-
-  if (parsed.action === "name") {
-    const value = interaction.fields.getTextInputValue("recruit-name").trim();
-
-    if (!value || value.length > 80) {
-      await interaction.reply({
-        content: "タイトルは1〜80文字で入力してください。",
-        ephemeral: true,
-      });
-      return;
-    }
-
-    session.eventName = value;
-    await interaction.update(setupPanel(session));
-  }
+  session.eventName = value;
+  await interaction.update(setupPanel(session));
 }
 
 export async function handleRecruitButton(
