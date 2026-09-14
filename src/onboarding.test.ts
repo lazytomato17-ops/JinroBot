@@ -32,6 +32,7 @@ describe("初回ガイド", () => {
       description: "コマンドと遊び方を確認します",
     });
     expect(helpText()).toContain("`/jinro`");
+    expect(helpText()).toContain("`/recruit`");
     expect(helpText()).toContain("`/guide`");
     expect(helpText()).toContain("`/stats`");
     expect(helpText()).toContain("`/invite`");

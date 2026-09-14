@@ -30,6 +30,12 @@ import {
   isRankingButton,
 } from "./ranking";
 import { showStats } from "./stats";
+import {
+  handleRecruitButton,
+  handleRecruitCommand,
+  isRecruitButton,
+  recruitCommand,
+} from "./scheduled-event";
 
 dotenv.config();
 
@@ -51,6 +57,7 @@ const commands = [
   helpCommand,
   guideCommand,
   inviteCommand,
+  recruitCommand,
   new SlashCommandBuilder()
     .setName("analytics")
     .setDescription("運営者専用のプレイ状況を表示します"),
@@ -133,6 +140,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handleHelpCommand(interaction);
       } else if (interaction.commandName === "invite") {
         await handleInviteCommand(interaction);
+      } else if (interaction.commandName === "recruit") {
+        await handleRecruitCommand(interaction);
       } else if (interaction.commandName === "analytics") {
         await handleAdminAnalyticsCommand(interaction);
       } else if (interaction.commandName === "ranking") {
@@ -161,6 +170,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.isButton() && isRankingButton(interaction.customId)) {
         await handleRankingButton(interaction);
+        return;
+      }
+      if (interaction.isButton() && isRecruitButton(interaction.customId)) {
+        await handleRecruitButton(interaction);
         return;
       }
       await handleComponent(interaction);

@@ -16,7 +16,7 @@ import {
   TextInputBuilder,
   TextInputStyle,
 } from "discord.js";
-import type { MessageCreateOptions } from "discord.js";
+import type { MessageCreateOptions, User } from "discord.js";
 import { randomUUID } from "node:crypto";
 import { isBetaTester } from "./access";
 import {
@@ -1093,17 +1093,38 @@ export function syncRecommendedLobbyRoleConfig(
   return true;
 }
 
+export interface CreateLobbyOptions {
+  participants?: User[];
+  targetPlayerCount?: number;
+}
+
+async function replyLobbyError(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  content: string,
+): Promise<void> {
+  if (interaction.deferred) {
+    await interaction.editReply({ content, embeds: [], components: [] });
+    return;
+  }
+  if (interaction.replied) {
+    await interaction.followUp({ content, ephemeral: true });
+    return;
+  }
+  await interaction.reply({ content, ephemeral: true });
+}
+
 export async function createLobby(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
+  options: CreateLobbyOptions = {},
 ): Promise<void> {
   if (
     !interaction.inGuild() ||
     interaction.channel?.type !== ChannelType.GuildText
   ) {
-    await interaction.reply({
-      content: "サーバーのテキストチャンネルで実行してください。",
-      ephemeral: true,
-    });
+    await replyLobbyError(
+      interaction,
+      "サーバーのテキストチャンネルで実行してください。",
+    );
     return;
   }
 
@@ -1114,30 +1135,49 @@ export async function createLobby(
     void existing.phaseMessage?.edit({ components: [] }).catch(() => undefined);
     void disableFeedbackPanel(existing);
   } else if (existing) {
-    await interaction.reply({
-      content: "このチャンネルでは既にゲームが進行中です。",
-      ephemeral: true,
-    });
+    await replyLobbyError(
+      interaction,
+      "このチャンネルでは既にゲームが進行中です。",
+    );
     return;
   }
 
+  const participantUsers = [interaction.user, ...(options.participants ?? [])].filter(
+    (user, index, users) =>
+      !user.bot &&
+      users.findIndex((candidate) => candidate.id === user.id) === index,
+  );
+  if (participantUsers.length > MAX_PLAYERS) {
+    await replyLobbyError(
+      interaction,
+      `参加者が${MAX_PLAYERS}人を超えています。Discordイベントの「興味あり」を${MAX_PLAYERS}人以下にしてから、もう一度開始してください。`,
+    );
+    return;
+  }
+
+  const requestedTarget = options.targetPlayerCount ?? SOLO_PLAYER_COUNT;
+  const targetPlayerCount = Math.min(
+    MAX_PLAYERS,
+    Math.max(MIN_PLAYERS, requestedTarget, participantUsers.length),
+  );
   const analyticsSessionId = randomUUID();
   const game: GameState = {
     channelId: interaction.channelId,
     channel: interaction.channel as TextChannel,
     hostId: interaction.user.id,
     phase: "lobby",
-    players: [
-      {
-        id: interaction.user.id,
-        name: interaction.user.displayName,
-        user: interaction.user,
-        isNpc: false,
-        alive: true,
-      },
-    ],
-    targetPlayerCount: SOLO_PLAYER_COUNT,
-    roleConfig: recommendedLobbyRoleConfig(SOLO_PLAYER_COUNT, 1),
+    players: participantUsers.map((user) => ({
+      id: user.id,
+      name: user.displayName,
+      user,
+      isNpc: false,
+      alive: true,
+    })),
+    targetPlayerCount,
+    roleConfig: recommendedLobbyRoleConfig(
+      targetPlayerCount,
+      participantUsers.length,
+    ),
     roleDmSent: new Set(),
     roleDmFailures: new Set(),
     pendingDmMessages: new Map(),
@@ -1173,9 +1213,25 @@ export async function createLobby(
   };
 
   games.set(game.channelId, game);
+  let responseStarted = Boolean(interaction.deferred || interaction.replied);
   try {
-    await interaction.reply(lobbyPayload(game));
-    const lobbyMessage = (await interaction.fetchReply()) as Message;
+    let lobbyMessage: Message;
+    if (responseStarted) {
+      lobbyMessage = (await interaction.followUp(lobbyPayload(game))) as Message;
+      if (interaction.deferred) {
+        await interaction
+          .editReply({
+            content: `ロビーを作成しました。参加者：${participantUsers.length}人`,
+            embeds: [],
+            components: [],
+          })
+          .catch(() => undefined);
+      }
+    } else {
+      await interaction.reply(lobbyPayload(game));
+      responseStarted = true;
+      lobbyMessage = (await interaction.fetchReply()) as Message;
+    }
     if (!isActiveGame(game)) {
       await lobbyMessage
         .edit({
@@ -1194,14 +1250,17 @@ export async function createLobby(
       clearGameTimers(game);
       games.delete(game.channelId);
     }
-    await interaction
-      .editReply({
-        content:
-          "募集画面を準備できなかったため、この募集を終了しました。もう一度 `/jinro` を実行してください。",
-        embeds: [],
-        components: [],
-      })
-      .catch(() => undefined);
+    const failure =
+      "募集画面を準備できなかったため、この募集を終了しました。もう一度 `/jinro` を実行してください。";
+    if (responseStarted) {
+      await interaction
+        .editReply({ content: failure, embeds: [], components: [] })
+        .catch(() => undefined);
+    } else {
+      await interaction
+        .reply({ content: failure, ephemeral: true })
+        .catch(() => undefined);
+    }
     console.error("Lobby creation failed:", error);
   }
 }

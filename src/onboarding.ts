@@ -12,7 +12,7 @@ import {
 
 export const GUIDE_SITE_URL = "https://tomatobot-web.onrender.com/#how-to-play";
 export const BOT_INVITE_URL =
-  "https://discord.com/oauth2/authorize?client_id=1442475786736242807&scope=bot%20applications.commands&permissions=0";
+  "https://discord.com/oauth2/authorize?client_id=1442475786736242807&scope=bot%20applications.commands&permissions=17592186044416";
 export const ONBOARDING_QUICK_START_BUTTON_ID =
   "tomatobot-onboarding-quick-start";
 
@@ -133,7 +133,8 @@ export function onboardingText(): string {
 export function helpText(): string {
   return [
     "🐺 **TomatoBot｜ヘルプ**",
-    "`/jinro`　人狼ゲームの募集を始める",
+    "`/jinro`　今すぐ人狼ゲームの募集を始める",
+    "`/recruit`　Discordイベントを作って後の時間の参加者を募集する",
     "`/guide`　最初の一戦の始め方を見る",
     "`/stats`　自分の戦績を確認する",
     "`/ranking join`　公開ランキングに参加する",
