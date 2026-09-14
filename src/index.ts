@@ -29,9 +29,9 @@ import {
   handleRankingCommand,
   isRankingButton,
 } from "./ranking";
+import { handleRecruitStartButton } from "./recruit-start";
 import { showStats } from "./stats";
 import {
-  handleRecruitButton,
   handleRecruitCommand,
   handleRecruitSetupButton,
   handleRecruitSetupModal,
@@ -198,7 +198,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
       if (interaction.isButton() && isRecruitButton(interaction.customId)) {
-        await handleRecruitButton(interaction);
+        await handleRecruitStartButton(interaction);
         return;
       }
       await handleComponent(interaction);
