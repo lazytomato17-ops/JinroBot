@@ -33,7 +33,10 @@ import { showStats } from "./stats";
 import {
   handleRecruitButton,
   handleRecruitCommand,
+  handleRecruitSetupButton,
+  handleRecruitSetupModal,
   isRecruitButton,
+  isRecruitSetupComponent,
   recruitCommand,
 } from "./scheduled-event";
 
@@ -170,6 +173,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.isButton() && isRankingButton(interaction.customId)) {
         await handleRankingButton(interaction);
+        return;
+      }
+      if (
+        interaction.isButton() &&
+        isRecruitSetupComponent(interaction.customId)
+      ) {
+        await handleRecruitSetupButton(interaction);
+        return;
+      }
+      if (
+        interaction.isModalSubmit() &&
+        isRecruitSetupComponent(interaction.customId)
+      ) {
+        await handleRecruitSetupModal(interaction);
         return;
       }
       if (interaction.isButton() && isRecruitButton(interaction.customId)) {

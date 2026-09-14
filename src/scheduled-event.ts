@@ -9,40 +9,46 @@ import {
   GuildScheduledEventEntityType,
   GuildScheduledEventPrivacyLevel,
   GuildScheduledEventStatus,
+  ModalBuilder,
+  ModalSubmitInteraction,
   PermissionFlagsBits,
   SlashCommandBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } from "discord.js";
 import { createLobby } from "./game";
 
-const DEFAULT_TARGET_PLAYER_COUNT = 4;
+const DEFAULT_TARGET_PLAYER_COUNT = 8;
 const MAX_PLAYER_COUNT = 15;
 const EVENT_DURATION_MS = 2 * 60 * 60 * 1000;
 const RECRUIT_BUTTON_PREFIX = "tb-recruit:start:";
+const RECRUIT_SETUP_PREFIX = "tb-recruit:setup:";
+const RECRUIT_SETUP_TTL_MS = 30 * 60 * 1000;
+const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+type RecruitSetupAction =
+  | "datetime"
+  | "players"
+  | "name"
+  | "create"
+  | "cancel";
+
+interface RecruitSetupSession {
+  id: string;
+  hostId: string;
+  guildId: string;
+  channelId: string;
+  eventName: string;
+  targetPlayerCount: number;
+  startAt?: Date;
+  createdAt: number;
+}
+
+const recruitSetupSessions = new Map<string, RecruitSetupSession>();
 
 export const recruitCommand = new SlashCommandBuilder()
   .setName("recruit")
-  .setDescription("Discordイベントで人狼の参加者を募集します")
-  .addIntegerOption((option) =>
-    option
-      .setName("minutes")
-      .setDescription("開始までの時間（分）")
-      .setRequired(true)
-      .setMinValue(10)
-      .setMaxValue(7 * 24 * 60),
-  )
-  .addIntegerOption((option) =>
-    option
-      .setName("players")
-      .setDescription("予定プレイ人数（4〜15人、未指定なら4人）")
-      .setMinValue(4)
-      .setMaxValue(MAX_PLAYER_COUNT),
-  )
-  .addStringOption((option) =>
-    option
-      .setName("name")
-      .setDescription("イベント名（未指定なら自動生成）")
-      .setMaxLength(80),
-  );
+  .setDescription("Discordイベントで人狼の参加者を募集します");
 
 export interface RecruitButtonData {
   eventId: string;
@@ -77,8 +83,281 @@ export function isRecruitButton(customId: string): boolean {
   return parseRecruitButtonCustomId(customId) !== undefined;
 }
 
+function normaliseInput(value: string): string {
+  return value
+    .replace(/[０-９]/g, (char) =>
+      String.fromCharCode(char.charCodeAt(0) - 0xfee0),
+    )
+    .replace(/／/g, "/")
+    .replace(/：/g, ":")
+    .replace(/[－―ー]/g, "-")
+    .trim();
+}
+
+function jstParts(date: Date): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+} {
+  const shifted = new Date(date.getTime() + JST_OFFSET_MS);
+  return {
+    year: shifted.getUTCFullYear(),
+    month: shifted.getUTCMonth() + 1,
+    day: shifted.getUTCDate(),
+    hour: shifted.getUTCHours(),
+    minute: shifted.getUTCMinutes(),
+  };
+}
+
+function makeJstDate(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+): Date | undefined {
+  const result = new Date(
+    Date.UTC(year, month - 1, day, hour, minute) - JST_OFFSET_MS,
+  );
+  const parts = jstParts(result);
+  if (
+    parts.year !== year ||
+    parts.month !== month ||
+    parts.day !== day ||
+    parts.hour !== hour ||
+    parts.minute !== minute
+  ) {
+    return undefined;
+  }
+  return result;
+}
+
+export type RecruitStartAtParseResult =
+  | { ok: true; value: Date }
+  | { ok: false; error: string };
+
+export function parseRecruitStartAt(
+  dateInput: string,
+  timeInput: string,
+  now = new Date(),
+): RecruitStartAtParseResult {
+  const dateText = normaliseInput(dateInput);
+  const timeText = normaliseInput(timeInput);
+  const dateMatch = /^(?:(\d{4})[\/-])?(\d{1,2})[\/-](\d{1,2})$/.exec(
+    dateText,
+  );
+  const timeMatch = /^(\d{1,2}):(\d{2})$/.exec(timeText);
+
+  if (!dateMatch) {
+    return {
+      ok: false,
+      error: "日付は `9/20` または `2026-09-20` の形で入力してください。",
+    };
+  }
+  if (!timeMatch) {
+    return {
+      ok: false,
+      error: "時刻は `21:00` の形で入力してください。",
+    };
+  }
+
+  const explicitYear = dateMatch[1] ? Number(dateMatch[1]) : undefined;
+  const month = Number(dateMatch[2]);
+  const day = Number(dateMatch[3]);
+  const hour = Number(timeMatch[1]);
+  const minute = Number(timeMatch[2]);
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hour < 0 ||
+    hour > 23 ||
+    minute < 0 ||
+    minute > 59
+  ) {
+    return { ok: false, error: "日付または時刻が正しくありません。" };
+  }
+
+  const currentYear = jstParts(now).year;
+  let year = explicitYear ?? currentYear;
+  let startAt = makeJstDate(year, month, day, hour, minute);
+  if (!startAt) {
+    return { ok: false, error: "存在しない日付です。" };
+  }
+
+  if (!explicitYear && startAt.getTime() <= now.getTime()) {
+    year += 1;
+    startAt = makeJstDate(year, month, day, hour, minute);
+    if (!startAt) {
+      return { ok: false, error: "存在しない日付です。" };
+    }
+  }
+
+  if (startAt.getTime() <= now.getTime()) {
+    return { ok: false, error: "開始日時は現在より後にしてください。" };
+  }
+
+  return { ok: true, value: startAt };
+}
+
+function setupCustomId(sessionId: string, action: RecruitSetupAction): string {
+  return `${RECRUIT_SETUP_PREFIX}${sessionId}:${action}`;
+}
+
+function parseSetupCustomId(
+  customId: string,
+): { sessionId: string; action: RecruitSetupAction } | undefined {
+  if (!customId.startsWith(RECRUIT_SETUP_PREFIX)) return undefined;
+  const [sessionId, action, ...rest] = customId
+    .slice(RECRUIT_SETUP_PREFIX.length)
+    .split(":");
+  if (rest.length || !/^[a-z0-9]+$/i.test(sessionId ?? "")) return undefined;
+  if (
+    action !== "datetime" &&
+    action !== "players" &&
+    action !== "name" &&
+    action !== "create" &&
+    action !== "cancel"
+  ) {
+    return undefined;
+  }
+  return { sessionId, action };
+}
+
+export function isRecruitSetupComponent(customId: string): boolean {
+  return parseSetupCustomId(customId) !== undefined;
+}
+
+function newSetupSessionId(): string {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function getSetupSession(sessionId: string): RecruitSetupSession | undefined {
+  const session = recruitSetupSessions.get(sessionId);
+  if (!session) return undefined;
+  if (Date.now() - session.createdAt > RECRUIT_SETUP_TTL_MS) {
+    recruitSetupSessions.delete(sessionId);
+    return undefined;
+  }
+  return session;
+}
+
+function setupPanel(session: RecruitSetupSession): {
+  embeds: EmbedBuilder[];
+  components: ActionRowBuilder<ButtonBuilder>[];
+} {
+  const startText = session.startAt
+    ? `<t:${Math.floor(session.startAt.getTime() / 1000)}:F>（<t:${Math.floor(session.startAt.getTime() / 1000)}:R>）`
+    : "**未設定**";
+
+  const embed = new EmbedBuilder()
+    .setTitle("人狼募集の設定")
+    .setDescription(
+      [
+        `📅 開始日時：${startText}`,
+        `👥 募集人数：**${session.targetPlayerCount}人**`,
+        `📝 タイトル：**${session.eventName}**`,
+        "",
+        "必要な項目を変更して、最後に「募集開始」を押してください。",
+      ].join("\n"),
+    )
+    .setColor(0x5865f2)
+    .setFooter({ text: "日時は日本時間（JST）として扱います・設定は30分で期限切れ" });
+
+  const settingsRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(setupCustomId(session.id, "datetime"))
+      .setLabel("日時を設定")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(setupCustomId(session.id, "players"))
+      .setLabel("人数を設定")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(setupCustomId(session.id, "name"))
+      .setLabel("タイトルを設定")
+      .setStyle(ButtonStyle.Secondary),
+  );
+
+  const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(setupCustomId(session.id, "create"))
+      .setLabel("募集開始")
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(!session.startAt),
+    new ButtonBuilder()
+      .setCustomId(setupCustomId(session.id, "cancel"))
+      .setLabel("キャンセル")
+      .setStyle(ButtonStyle.Danger),
+  );
+
+  return { embeds: [embed], components: [settingsRow, actionRow] };
+}
+
+function dateInputValue(date: Date | undefined): string | undefined {
+  if (!date) return undefined;
+  const { year, month, day } = jstParts(date);
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function timeInputValue(date: Date | undefined): string | undefined {
+  if (!date) return undefined;
+  const { hour, minute } = jstParts(date);
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
 function discordEventUrl(guildId: string, eventId: string): string {
   return `https://discord.com/events/${guildId}/${eventId}`;
+}
+
+function recruitmentMessage(
+  eventName: string,
+  startAt: Date,
+  targetPlayerCount: number,
+  hostId: string,
+  hostDisplayName: string,
+  guildId: string,
+  eventId: string,
+): {
+  embeds: EmbedBuilder[];
+  components: ActionRowBuilder<ButtonBuilder>[];
+} {
+  const eventUrl = discordEventUrl(guildId, eventId);
+  const embed = new EmbedBuilder()
+    .setTitle(eventName)
+    .setDescription(
+      [
+        `開始：<t:${Math.floor(startAt.getTime() / 1000)}:F>（<t:${Math.floor(startAt.getTime() / 1000)}:R>）`,
+        `予定人数：**${targetPlayerCount}人**`,
+        "",
+        "参加する人はDiscordイベントを開いて **「興味あり」** を押してください。",
+        "開始時にホストが下のボタンを押すと、参加表明したメンバーで人狼ロビーを作成します。",
+      ].join("\n"),
+    )
+    .setColor(0x5865f2)
+    .setFooter({ text: `ホスト：${hostDisplayName}` });
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setLabel("Discordイベントを開く")
+      .setStyle(ButtonStyle.Link)
+      .setURL(eventUrl),
+    new ButtonBuilder()
+      .setCustomId(
+        recruitButtonCustomId({
+          eventId,
+          hostId,
+          targetPlayerCount,
+        }),
+      )
+      .setLabel("ロビーを作成")
+      .setStyle(ButtonStyle.Success),
+  );
+
+  return { embeds: [embed], components: [row] };
 }
 
 export async function handleRecruitCommand(
@@ -96,10 +375,7 @@ export async function handleRecruitCommand(
     return;
   }
 
-  const canCreateEvents = Boolean(
-    interaction.memberPermissions?.has(PermissionFlagsBits.CreateEvents),
-  );
-  if (!canCreateEvents) {
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.CreateEvents)) {
     await interaction.reply({
       content: "Discordイベントを作成する権限がありません。サーバーで「イベントを作成」権限を付けてもらってください。",
       ephemeral: true,
@@ -107,74 +383,280 @@ export async function handleRecruitCommand(
     return;
   }
 
-  const minutes = interaction.options.getInteger("minutes", true);
-  const targetPlayerCount =
-    interaction.options.getInteger("players") ?? DEFAULT_TARGET_PLAYER_COUNT;
-  const customName = interaction.options.getString("name")?.trim();
-  const eventName = customName || `人狼ゲーム｜${targetPlayerCount}人募集`;
-  const startAt = new Date(Date.now() + minutes * 60_000);
-  const endAt = new Date(startAt.getTime() + EVENT_DURATION_MS);
+  if (
+    interaction.appPermissions &&
+    (!interaction.appPermissions.has(PermissionFlagsBits.CreateEvents) ||
+      !interaction.appPermissions.has(PermissionFlagsBits.SendMessages))
+  ) {
+    await interaction.reply({
+      content: "Botに「イベントを作成」と「メッセージを送信」の権限が必要です。",
+      ephemeral: true,
+    });
+    return;
+  }
 
-  await interaction.deferReply();
+  const session: RecruitSetupSession = {
+    id: newSetupSessionId(),
+    hostId: interaction.user.id,
+    guildId: interaction.guildId,
+    channelId: interaction.channelId,
+    eventName: "人狼ゲーム",
+    targetPlayerCount: DEFAULT_TARGET_PLAYER_COUNT,
+    createdAt: Date.now(),
+  };
+  recruitSetupSessions.set(session.id, session);
+
+  await interaction.reply({ ...setupPanel(session), ephemeral: true });
+}
+
+export async function handleRecruitSetupButton(
+  interaction: ButtonInteraction,
+): Promise<void> {
+  const parsed = parseSetupCustomId(interaction.customId);
+  if (!parsed) return;
+
+  const session = getSetupSession(parsed.sessionId);
+  if (
+    !session ||
+    interaction.user.id !== session.hostId ||
+    interaction.guildId !== session.guildId
+  ) {
+    await interaction.reply({
+      content: "この募集設定は期限切れです。もう一度 `/recruit` を実行してください。",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (parsed.action === "datetime") {
+    const dateInput = new TextInputBuilder()
+      .setCustomId("recruit-date")
+      .setLabel("開始日")
+      .setStyle(TextInputStyle.Short)
+      .setPlaceholder("例: 9/20 または 2026-09-20")
+      .setRequired(true);
+    const currentDate = dateInputValue(session.startAt);
+    if (currentDate) dateInput.setValue(currentDate);
+
+    const timeInput = new TextInputBuilder()
+      .setCustomId("recruit-time")
+      .setLabel("開始時刻（日本時間）")
+      .setStyle(TextInputStyle.Short)
+      .setPlaceholder("例: 21:00")
+      .setRequired(true);
+    const currentTime = timeInputValue(session.startAt);
+    if (currentTime) timeInput.setValue(currentTime);
+
+    const modal = new ModalBuilder()
+      .setCustomId(setupCustomId(session.id, "datetime"))
+      .setTitle("開始日時を設定")
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(dateInput),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(timeInput),
+      );
+    await interaction.showModal(modal);
+    return;
+  }
+
+  if (parsed.action === "players") {
+    const playersInput = new TextInputBuilder()
+      .setCustomId("recruit-players")
+      .setLabel(`募集人数（4〜${MAX_PLAYER_COUNT}人）`)
+      .setStyle(TextInputStyle.Short)
+      .setValue(String(session.targetPlayerCount))
+      .setMinLength(1)
+      .setMaxLength(2)
+      .setRequired(true);
+    const modal = new ModalBuilder()
+      .setCustomId(setupCustomId(session.id, "players"))
+      .setTitle("募集人数を設定")
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(playersInput),
+      );
+    await interaction.showModal(modal);
+    return;
+  }
+
+  if (parsed.action === "name") {
+    const nameInput = new TextInputBuilder()
+      .setCustomId("recruit-name")
+      .setLabel("イベント名")
+      .setStyle(TextInputStyle.Short)
+      .setValue(session.eventName)
+      .setMinLength(1)
+      .setMaxLength(80)
+      .setRequired(true);
+    const modal = new ModalBuilder()
+      .setCustomId(setupCustomId(session.id, "name"))
+      .setTitle("タイトルを設定")
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(nameInput),
+      );
+    await interaction.showModal(modal);
+    return;
+  }
+
+  if (parsed.action === "cancel") {
+    recruitSetupSessions.delete(session.id);
+    await interaction.update({
+      content: "募集設定をキャンセルしました。",
+      embeds: [],
+      components: [],
+    });
+    return;
+  }
+
+  if (!session.startAt) {
+    await interaction.reply({
+      content: "先に開始日時を設定してください。",
+      ephemeral: true,
+    });
+    return;
+  }
+  if (session.startAt.getTime() <= Date.now()) {
+    session.startAt = undefined;
+    await interaction.update({
+      content: "設定した開始日時を過ぎています。日時を設定し直してください。",
+      ...setupPanel(session),
+    });
+    return;
+  }
+  if (
+    !interaction.inGuild() ||
+    !interaction.guild ||
+    interaction.channel?.type !== ChannelType.GuildText ||
+    interaction.channelId !== session.channelId
+  ) {
+    await interaction.reply({
+      content: "募集を設定したテキストチャンネルで操作してください。",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const channel = interaction.channel;
+  await interaction.deferUpdate();
+  let event;
   try {
-    const event = await interaction.guild.scheduledEvents.create({
-      name: eventName,
+    event = await interaction.guild.scheduledEvents.create({
+      name: session.eventName,
       description: [
         "Tomatobotの人狼募集です。",
         "参加する人はこのイベントの「興味あり」を押してください。",
-        `予定人数：${targetPlayerCount}人（最大${MAX_PLAYER_COUNT}人）`,
-        `開催チャンネル：<#${interaction.channelId}>`,
+        `予定人数：${session.targetPlayerCount}人（最大${MAX_PLAYER_COUNT}人）`,
+        `開催チャンネル：<#${session.channelId}>`,
         "開始時にホストが募集メッセージのボタンを押すと、興味ありのメンバーをロビーへ取り込みます。",
       ].join("\n"),
       entityType: GuildScheduledEventEntityType.External,
       privacyLevel: GuildScheduledEventPrivacyLevel.GuildOnly,
-      scheduledStartTime: startAt,
-      scheduledEndTime: endAt,
-      entityMetadata: { location: `#${interaction.channel.name}` },
+      scheduledStartTime: session.startAt,
+      scheduledEndTime: new Date(session.startAt.getTime() + EVENT_DURATION_MS),
+      entityMetadata: { location: `#${channel.name}` },
       reason: `Tomatobot recruitment created by ${interaction.user.tag}`,
     });
-
-    const eventUrl = event.url || discordEventUrl(interaction.guildId, event.id);
-    const embed = new EmbedBuilder()
-      .setTitle(eventName)
-      .setDescription(
-        [
-          `開始：<t:${Math.floor(startAt.getTime() / 1000)}:F>（<t:${Math.floor(startAt.getTime() / 1000)}:R>）`,
-          `予定人数：**${targetPlayerCount}人**`,
-          "",
-          "参加する人はDiscordイベントを開いて **「興味あり」** を押してください。",
-          "開始時にホストが下のボタンを押すと、参加表明したメンバーで既存の人狼ロビーを作成します。",
-        ].join("\n"),
-      )
-      .setColor(0x5865f2)
-      .setFooter({ text: `ホスト：${interaction.user.displayName}` });
-
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setLabel("Discordイベントを開く")
-        .setStyle(ButtonStyle.Link)
-        .setURL(eventUrl),
-      new ButtonBuilder()
-        .setCustomId(
-          recruitButtonCustomId({
-            eventId: event.id,
-            hostId: interaction.user.id,
-            targetPlayerCount,
-          }),
-        )
-        .setLabel("ロビーを作成")
-        .setStyle(ButtonStyle.Success),
-    );
-
-    await interaction.editReply({ embeds: [embed], components: [row] });
   } catch (error) {
     console.error("Scheduled event creation failed:", error);
     await interaction.editReply({
-      content:
-        "Discordイベントを作成できませんでした。Botに「イベントを作成 / イベントを管理」権限があるか確認してください。",
-      embeds: [],
-      components: [],
+      content: "Discordイベントを作成できませんでした。Botのイベント権限を確認してください。",
+      ...setupPanel(session),
     });
+    return;
+  }
+
+  try {
+    await channel.send(
+      recruitmentMessage(
+        session.eventName,
+        session.startAt,
+        session.targetPlayerCount,
+        session.hostId,
+        interaction.user.displayName,
+        interaction.guildId,
+        event.id,
+      ),
+    );
+  } catch (error) {
+    console.error("Recruitment message send failed:", error);
+    await event.delete("Recruitment message could not be sent").catch(() => undefined);
+    await interaction.editReply({
+      content: "募集メッセージを送信できませんでした。Botのメッセージ送信権限を確認してください。",
+      ...setupPanel(session),
+    });
+    return;
+  }
+
+  recruitSetupSessions.delete(session.id);
+  const eventUrl = event.url || discordEventUrl(interaction.guildId, event.id);
+  await interaction.editReply({
+    content: `募集を開始しました。\n${eventUrl}`,
+    embeds: [],
+    components: [],
+  });
+}
+
+export async function handleRecruitSetupModal(
+  interaction: ModalSubmitInteraction,
+): Promise<void> {
+  const parsed = parseSetupCustomId(interaction.customId);
+  if (!parsed) return;
+  const session = getSetupSession(parsed.sessionId);
+  if (
+    !session ||
+    interaction.user.id !== session.hostId ||
+    interaction.guildId !== session.guildId
+  ) {
+    await interaction.reply({
+      content: "この募集設定は期限切れです。もう一度 `/recruit` を実行してください。",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (parsed.action === "datetime") {
+    const result = parseRecruitStartAt(
+      interaction.fields.getTextInputValue("recruit-date"),
+      interaction.fields.getTextInputValue("recruit-time"),
+    );
+    if (!result.ok) {
+      await interaction.reply({ content: result.error, ephemeral: true });
+      return;
+    }
+    session.startAt = result.value;
+    await interaction.update({ content: null, ...setupPanel(session) });
+    return;
+  }
+
+  if (parsed.action === "players") {
+    const value = Number(
+      normaliseInput(interaction.fields.getTextInputValue("recruit-players")),
+    );
+    if (
+      !Number.isInteger(value) ||
+      value < 4 ||
+      value > MAX_PLAYER_COUNT
+    ) {
+      await interaction.reply({
+        content: `募集人数は4〜${MAX_PLAYER_COUNT}の整数で入力してください。`,
+        ephemeral: true,
+      });
+      return;
+    }
+    session.targetPlayerCount = value;
+    await interaction.update({ content: null, ...setupPanel(session) });
+    return;
+  }
+
+  if (parsed.action === "name") {
+    const value = interaction.fields.getTextInputValue("recruit-name").trim();
+    if (!value || value.length > 80) {
+      await interaction.reply({
+        content: "タイトルは1〜80文字で入力してください。",
+        ephemeral: true,
+      });
+      return;
+    }
+    session.eventName = value;
+    await interaction.update({ content: null, ...setupPanel(session) });
   }
 }
 
