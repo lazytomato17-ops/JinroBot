@@ -434,7 +434,7 @@ function recruitmentMessage(
         `予定人数：**${targetPlayerCount}人**`,
         "",
         "参加する人はDiscordイベントを開いて **「興味あり」** を押してください。",
-        "開始時にホストが下のボタンを押すと、参加表明したメンバーで人狼ロビーを作成します。",
+        "開始時刻になったら、ホストが下のボタンを押すと参加表明したメンバーで人狼ロビーを作成します。",
       ].join("\n"),
     )
     .setColor(0x5865f2)
@@ -453,7 +453,7 @@ function recruitmentMessage(
           targetPlayerCount,
         }),
       )
-      .setLabel("ロビーを作成")
+      .setLabel("開始時刻にロビー作成")
       .setStyle(ButtonStyle.Success),
   );
 
@@ -696,7 +696,7 @@ export async function handleRecruitSetupButton(
         "参加する人はこのイベントの「興味あり」を押してください。",
         `予定人数：${session.targetPlayerCount}人（最大${MAX_PLAYER_COUNT}人）`,
         `開催チャンネル：<#${session.channelId}>`,
-        "開始時にホストが募集メッセージのボタンを押すと、興味ありのメンバーをロビーへ取り込みます。",
+        "開始時刻になったらホストが募集メッセージのボタンを押すと、興味ありのメンバーをロビーへ取り込みます。",
       ].join("\n"),
       entityType: GuildScheduledEventEntityType.External,
       privacyLevel: GuildScheduledEventPrivacyLevel.GuildOnly,
@@ -810,12 +810,13 @@ export async function handleRecruitButton(
     return;
   }
 
-  await interaction.deferReply({ ephemeral: true });
-
   try {
     const event = await interaction.guild.scheduledEvents.fetch(data.eventId);
     if (!event) {
-      await interaction.editReply("Discordイベントが見つかりませんでした。");
+      await interaction.reply({
+        content: "Discordイベントが見つかりませんでした。",
+        ephemeral: true,
+      });
       return;
     }
 
@@ -823,7 +824,28 @@ export async function handleRecruitButton(
       event.status === GuildScheduledEventStatus.Canceled ||
       event.status === GuildScheduledEventStatus.Completed
     ) {
-      await interaction.editReply("このDiscordイベントはすでに終了しています。");
+      await interaction.reply({
+        content: "このDiscordイベントはすでに終了しています。",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const scheduledStartTimestamp = event.scheduledStartTimestamp;
+    if (!scheduledStartTimestamp) {
+      await interaction.reply({
+        content: "イベントの開始時刻を取得できませんでした。",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (Date.now() < scheduledStartTimestamp) {
+      const unix = Math.floor(scheduledStartTimestamp / 1000);
+      await interaction.reply({
+        content: `ロビーは開始時刻の <t:${unix}:F> から作成できます（<t:${unix}:R>）。`,
+        ephemeral: true,
+      });
       return;
     }
 
@@ -837,9 +859,10 @@ export async function handleRecruitButton(
     ).size;
 
     if (uniqueInterestedCount + 1 > MAX_PLAYER_COUNT) {
-      await interaction.editReply(
-        `ホストを含めて${uniqueInterestedCount + 1}人が参加予定です。Tomatobotは最大${MAX_PLAYER_COUNT}人なので、「興味あり」を${MAX_PLAYER_COUNT - 1}人以下にしてから開始してください。`,
-      );
+      await interaction.reply({
+        content: `ホストを含めて${uniqueInterestedCount + 1}人が参加予定です。Tomatobotは最大${MAX_PLAYER_COUNT}人なので、「興味あり」を${MAX_PLAYER_COUNT - 1}人以下にしてから開始してください。`,
+        ephemeral: true,
+      });
       return;
     }
 
@@ -847,13 +870,46 @@ export async function handleRecruitButton(
       participants: interestedUsers,
       targetPlayerCount: data.targetPlayerCount,
     });
+
+    const reply = await interaction.fetchReply().catch(() => null);
+    const lobbyCreated = Boolean(
+      reply?.embeds.some((embed) => embed.title === "人狼ゲーム｜参加受付"),
+    );
+
+    if (lobbyCreated) {
+      const eventUrl = event.url || discordEventUrl(interaction.guildId, event.id);
+      const completedRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setLabel("Discordイベントを開く")
+          .setStyle(ButtonStyle.Link)
+          .setURL(eventUrl),
+        new ButtonBuilder()
+          .setCustomId(interaction.customId)
+          .setLabel("ロビー作成済み")
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(true),
+      );
+      await interaction.message
+        .edit({ components: [completedRow] })
+        .catch(() => undefined);
+    }
   } catch (error) {
     console.error("Scheduled event lobby import failed:", error);
     if (interaction.replied || interaction.deferred) {
       await interaction
-        .editReply(
-          "イベントの参加者を取得できませんでした。イベントが削除されていないか、Botの権限を確認してください。",
-        )
+        .followUp({
+          content:
+            "イベントの参加者を取得できませんでした。イベントが削除されていないか、Botの権限を確認してください。",
+          ephemeral: true,
+        })
+        .catch(() => undefined);
+    } else {
+      await interaction
+        .reply({
+          content:
+            "イベントの参加者を取得できませんでした。イベントが削除されていないか、Botの権限を確認してください。",
+          ephemeral: true,
+        })
         .catch(() => undefined);
     }
   }
