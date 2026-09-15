@@ -1,4 +1,4 @@
-# 🐺 Tomatobot
+# 🐺 JinroBot
 
 Discordで遊べる、シンプルな人狼ゲームBotです。
 
