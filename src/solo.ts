@@ -1,4 +1,4 @@
-import { buildRoles } from "./roles";
+import { buildRoles, isActualWolfRole } from "./roles";
 import type { Player, RoleName } from "./types";
 
 export const SOLO_PLAYER_COUNT = 7;
@@ -52,8 +52,15 @@ export function chooseNpcVoteTarget(
   random: () => number = Math.random,
 ): string {
   let valid = candidates.filter((candidate) => candidate.id !== actor.id);
-  if (actor.role === "人狼") {
-    const nonWolves = valid.filter((candidate) => candidate.role !== "人狼");
+  if (
+    isActualWolfRole(actor.role) ||
+    actor.role === "狂信者" ||
+    actor.role === "妖術師" ||
+    actor.role === "分断者"
+  ) {
+    const nonWolves = valid.filter(
+      (candidate) => !isActualWolfRole(candidate.role),
+    );
     if (nonWolves.length) valid = nonWolves;
   }
   if (!valid.length) throw new Error("NPCの投票対象がいません。");
@@ -84,8 +91,15 @@ export function chooseNpcRevoteTarget(
   random: () => number = Math.random,
 ): string {
   let valid = candidates.filter((candidate) => candidate.id !== actor.id);
-  if (actor.role === "人狼") {
-    const nonWolves = valid.filter((candidate) => candidate.role !== "人狼");
+  if (
+    isActualWolfRole(actor.role) ||
+    actor.role === "狂信者" ||
+    actor.role === "妖術師" ||
+    actor.role === "分断者"
+  ) {
+    const nonWolves = valid.filter(
+      (candidate) => !isActualWolfRole(candidate.role),
+    );
     if (nonWolves.length) valid = nonWolves;
   }
   if (!valid.length) throw new Error("NPCの再投票対象がいません。");

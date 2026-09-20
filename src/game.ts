@@ -37,10 +37,14 @@ import {
 import {
   buildCustomRoles,
   buildRoles,
+  CONFIGURABLE_ROLE_NAMES,
   getWinner,
+  isActualWolfRole,
+  isWolfTeamRole,
   ROLE_INFO,
   ROLE_NAMES,
   roleConfigFromRoles,
+  seerResultForRole,
   shuffle,
   usesUnrestrictedRoleConfig,
 } from "./roles";
@@ -102,6 +106,16 @@ const MAX_PLAYERS = 15;
 const NPC_QUESTIONS_PER_DAY = 2;
 const WOLF_CHAT_MESSAGES_PER_NIGHT = 2;
 const ABANDON_REASON_WINDOW_MS = 10 * 60 * 1000;
+const LOQUACIOUS_WORDS = [
+  "投票",
+  "占い",
+  "怪しい",
+  "白い",
+  "昨日",
+  "理由",
+  "対抗",
+  "様子",
+];
 
 const games = new Map<string, GameState>();
 
@@ -474,7 +488,58 @@ function safeName(player: Player): string {
 }
 
 export function publicResultForRole(role?: RoleName): PublicResult {
-  return role === "人狼" ? "人狼" : "人間";
+  return seerResultForRole(role);
+}
+
+function loverPairs(game: GameState): Array<[string, string]> {
+  game.loverPairs ??= [];
+  return game.loverPairs;
+}
+
+function devoteeTargets(game: GameState): Map<string, string> {
+  game.devoteeTargets ??= new Map();
+  return game.devoteeTargets;
+}
+
+function usedRolePowers(game: GameState): Set<string> {
+  game.usedRolePowers ??= new Set();
+  return game.usedRolePowers;
+}
+
+function fatalWoundIds(game: GameState): Set<string> {
+  game.fatalWoundIds ??= new Set();
+  return game.fatalWoundIds;
+}
+
+function loquaciousMissions(game: GameState): Map<string, string> {
+  game.loquaciousMissions ??= new Map();
+  return game.loquaciousMissions;
+}
+
+function loquaciousCompleted(game: GameState): Set<string> {
+  game.loquaciousCompleted ??= new Set();
+  return game.loquaciousCompleted;
+}
+
+function winnerFor(game: GameState): Winner | null {
+  return getWinner(game.players, { loverPairs: loverPairs(game) });
+}
+
+function effectivePlayerTeam(
+  game: GameState,
+  player: Player,
+  visited = new Set<string>(),
+): string {
+  if (loverPairs(game).some((pair) => pair.includes(player.id))) return "lovers";
+  if (player.role === "妖狐") return "fox";
+  if (player.role === "てるてる") return "teruteru";
+  if (player.role === "純愛者" && !visited.has(player.id)) {
+    visited.add(player.id);
+    const targetId = devoteeTargets(game).get(player.id);
+    const target = game.players.find((candidate) => candidate.id === targetId);
+    if (target) return effectivePlayerTeam(game, target, visited);
+  }
+  return player.role ? ROLE_INFO[player.role].team : "villager";
 }
 
 function memoryFor(game: GameState, npcId: string): Map<string, number> {
@@ -856,11 +921,14 @@ function configuredRoles(game: GameState): RoleName[] {
 
 function roleConfigRows(game: GameState): string {
   const config = game.roleConfig;
-  return [
-    `${ROLE_INFO.人狼.icon} 人狼 **${config.人狼}**　　${ROLE_INFO.狂人.icon} 狂人 **${config.狂人}**`,
-    `${ROLE_INFO.占い師.icon} 占い師 **${config.占い師}**　　${ROLE_INFO.騎士.icon} 騎士 **${config.騎士}**`,
-    `${ROLE_INFO.霊能者.icon} 霊能者 **${config.霊能者}**　　${ROLE_INFO.村人.icon} 村人 **${config.村人}**`,
-  ].join("\n");
+  const visible = ROLE_NAMES.filter(
+    (role) => role === "村人" || config[role] > 0,
+  ).map((role) => `${ROLE_INFO[role].icon} ${role} **${config[role]}**`);
+  const rows: string[] = [];
+  for (let index = 0; index < visible.length; index += 2) {
+    rows.push(visible.slice(index, index + 2).join("　　"));
+  }
+  return rows.join("\n");
 }
 
 function mentionRows(players: Player[]): string {
@@ -869,16 +937,43 @@ function mentionRows(players: Player[]): string {
 
 export function dayEmbed(game: GameState): EmbedBuilder {
   const living = alivePlayers(game);
-  return new EmbedBuilder()
+  const bakerExists = game.roleConfig.パン屋 > 0;
+  const bakerAlive = living.some((player) => player.role === "パン屋");
+  const breadLine = bakerExists
+    ? bakerAlive
+      ? "\n\n🥐 今朝も焼きたてのパンが届きました。"
+      : "\n\n🥐 今朝はパンが届きませんでした。"
+    : "";
+  const openingDeathLine =
+    game.day === 1 && (game.openingDeathIds?.length ?? 0) > 0
+      ? `\n\n🦊 夜明け前、${game.openingDeathIds
+          ?.map((id) => game.players.find((player) => player.id === id))
+          .filter((player): player is Player => Boolean(player))
+          .map((player) => `**${safeName(player)}**`)
+          .join("、")} が占われて死亡しました。`
+      : "";
+  const embed = new EmbedBuilder()
     .setTitle(`${game.day}日目｜議論`)
     .setDescription(
-      `話し合って、投票先を決めよう。\n\n投票開始：${relativeTime(game.phaseEndsAt)}`,
+      `話し合って、投票先を決めよう。\n\n投票開始：${relativeTime(game.phaseEndsAt)}${openingDeathLine}${breadLine}`,
     )
     .addFields({
       name: `生存者（${living.length}人）`,
       value: playerNameRows(living),
     })
     .setColor(COLORS.day);
+  if (game.divisionGroups && game.divisionGroups.size > 0) {
+    for (const group of ["A", "B"] as const) {
+      const members = living.filter(
+        (player) => game.divisionGroups?.get(player.id) === group,
+      );
+      embed.addFields({
+        name: `分断議論｜${group}組`,
+        value: playerNameRows(members) || "—",
+      });
+    }
+  }
+  return embed;
 }
 
 export function finishedDayEmbed(game: GameState): EmbedBuilder {
@@ -1196,10 +1291,18 @@ export async function createLobby(
     humanSuspicions: new Map(),
     npcQuestionCounts: new Map(),
     seerResults: new Map(),
+    openingDeathIds: [],
     executionHistory: [],
     nightHistory: [],
     postgameRecapState: "idle",
     wolfChatCounts: new Map(),
+    loverPairs: [],
+    devoteeTargets: new Map(),
+    usedRolePowers: new Set(),
+    fatalWoundIds: new Set(),
+    divisionGroups: new Map(),
+    loquaciousMissions: new Map(),
+    loquaciousCompleted: new Set(),
     timers: [],
     resolving: false,
     resolutionQueued: false,
@@ -1601,17 +1704,9 @@ async function handlePlayerCountChange(
   ) {
     try {
       game.roleConfig = roleConfigFromRoles(
-        buildCustomRoles(
-          count,
-          {
-            人狼: game.roleConfig.人狼,
-            狂人: game.roleConfig.狂人,
-            占い師: game.roleConfig.占い師,
-            騎士: game.roleConfig.騎士,
-            霊能者: game.roleConfig.霊能者,
-          },
-          { unrestricted: isBetaTester(game.hostId) },
-        ),
+        buildCustomRoles(count, configurableRoleCounts(game.roleConfig), {
+          unrestricted: isBetaTester(game.hostId),
+        }),
       );
     } catch {
       game.roleConfig = recommendedLobbyRoleConfig(count, humans.length);
@@ -1629,18 +1724,30 @@ async function handlePlayerCountChange(
   }
 }
 
-type ConfigurableRole = "人狼" | "狂人" | "占い師" | "騎士" | "霊能者";
+type ConfigurableRole = Exclude<RoleName, "村人">;
 
-const CONFIGURABLE_ROLES: Array<{
-  role: ConfigurableRole;
-  action: "wolf" | "madman" | "seer" | "guard" | "medium";
-}> = [
-  { role: "人狼", action: "wolf" },
-  { role: "狂人", action: "madman" },
-  { role: "占い師", action: "seer" },
-  { role: "騎士", action: "guard" },
-  { role: "霊能者", action: "medium" },
-];
+function configurableRoleCounts(
+  config: GameState["roleConfig"],
+): Partial<Omit<GameState["roleConfig"], "村人">> &
+  Pick<GameState["roleConfig"], "人狼"> {
+  return Object.fromEntries(
+    CONFIGURABLE_ROLE_NAMES.map((role) => [role, config[role]]),
+  ) as Partial<Omit<GameState["roleConfig"], "村人">> &
+    Pick<GameState["roleConfig"], "人狼">;
+}
+
+function configurableRoleToken(role: ConfigurableRole): string {
+  return CONFIGURABLE_ROLE_NAMES.indexOf(role).toString(36);
+}
+
+function roleFromConfigurableToken(token: string): ConfigurableRole | undefined {
+  const index = Number.parseInt(token, 36);
+  return CONFIGURABLE_ROLE_NAMES[index] as ConfigurableRole | undefined;
+}
+
+function roleCountStep(role: ConfigurableRole): number {
+  return role === "共有者" ? 2 : 1;
+}
 
 export function usesUnrankedRoleConfig(
   game: Pick<GameState, "roleConfig">,
@@ -1653,13 +1760,8 @@ function canUseRoleCount(
   role: ConfigurableRole,
   count: number,
 ): boolean {
-  const proposed = {
-    人狼: role === "人狼" ? count : game.roleConfig.人狼,
-    狂人: role === "狂人" ? count : game.roleConfig.狂人,
-    占い師: role === "占い師" ? count : game.roleConfig.占い師,
-    騎士: role === "騎士" ? count : game.roleConfig.騎士,
-    霊能者: role === "霊能者" ? count : game.roleConfig.霊能者,
-  };
+  const proposed = configurableRoleCounts(game.roleConfig);
+  proposed[role] = count;
   try {
     buildCustomRoles(game.targetPlayerCount, proposed, {
       unrestricted: isBetaTester(game.hostId),
@@ -1670,40 +1772,99 @@ function canUseRoleCount(
   }
 }
 
-export function roleConfigPanel(game: GameState) {
+export function roleConfigPanel(
+  game: GameState,
+  selectedRole: ConfigurableRole = "人狼",
+) {
   const betaTester = isBetaTester(game.hostId);
   const embed = new EmbedBuilder()
     .setTitle(`配役設定｜${game.targetPlayerCount}人`)
     .setDescription(
       betaTester
-        ? "βテスター自由配役｜各役職の個別上限はありません。自由配役と逆村は戦績対象外です。"
-        : "占い師・狂人・霊能者は1人、騎士は2人まで設定できます。",
+        ? "βテスター自由配役｜共有者は2人単位ですが、各役職の個別上限はありません。自由配役は戦績対象外です。"
+        : "役職を選び、人数を調整してください。追加役職を使う試合は戦績対象外です。",
     )
-    .addFields({ name: "現在の配役", value: roleConfigRows(game) })
+    .addFields(
+      { name: "現在の配役", value: roleConfigRows(game) },
+      {
+        name: `${ROLE_INFO[selectedRole].icon} ${selectedRole}`,
+        value: ROLE_INFO[selectedRole].description,
+      },
+    )
     .setColor(COLORS.lobby)
     .setFooter({ text: "村人は残り人数から自動計算されます" });
 
-  const roleRows = CONFIGURABLE_ROLES.map(({ role, action }) => {
-    const current = game.roleConfig[role];
-    return new ActionRowBuilder<ButtonBuilder>().addComponents(
+  const selector = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(componentId("role-config-select", game))
+      .setPlaceholder("変更する役職を選ぶ")
+      .addOptions(
+        CONFIGURABLE_ROLE_NAMES.map((role) => ({
+          label: `${ROLE_INFO[role].icon} ${role}`,
+          description: `${ROLE_INFO[role].description.slice(0, 82)} (${game.roleConfig[role]}人)`,
+          value: configurableRoleToken(role as ConfigurableRole),
+          default: role === selectedRole,
+        })),
+      ),
+  );
+  const current = game.roleConfig[selectedRole];
+  const step = roleCountStep(selectedRole);
+  const adjust = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
-        .setCustomId(componentId(`role-decrease-${action}`, game))
+        .setCustomId(
+          componentId(
+            `role-decrease-${configurableRoleToken(selectedRole)}`,
+            game,
+          ),
+        )
         .setLabel("−")
         .setStyle(ButtonStyle.Secondary)
-        .setDisabled(!canUseRoleCount(game, role, current - 1)),
+        .setDisabled(!canUseRoleCount(game, selectedRole, current - step)),
       new ButtonBuilder()
-        .setCustomId(componentId(`role-current-${action}`, game))
-        .setLabel(`${ROLE_INFO[role].icon} ${role} ${current}人`)
+        .setCustomId(
+          componentId(
+            `role-current-${configurableRoleToken(selectedRole)}`,
+            game,
+          ),
+        )
+        .setLabel(`${ROLE_INFO[selectedRole].icon} ${selectedRole} ${current}人`)
         .setStyle(ButtonStyle.Secondary)
         .setDisabled(true),
       new ButtonBuilder()
-        .setCustomId(componentId(`role-increase-${action}`, game))
+        .setCustomId(
+          componentId(
+            `role-increase-${configurableRoleToken(selectedRole)}`,
+            game,
+          ),
+        )
         .setLabel("＋")
         .setStyle(ButtonStyle.Primary)
-        .setDisabled(!canUseRoleCount(game, role, current + 1)),
+        .setDisabled(!canUseRoleCount(game, selectedRole, current + step)),
     );
-  });
-  return { content: "", embeds: [embed], components: roleRows };
+  return { content: "", embeds: [embed], components: [selector, adjust] };
+}
+
+async function handleRoleConfigSelect(
+  interaction: StringSelectMenuInteraction,
+  game: GameState,
+): Promise<void> {
+  if (
+    interaction.user.id !== game.hostId ||
+    game.phase !== "lobby" ||
+    lobbyConfigurationLocked(game)
+  ) {
+    await interaction.reply({
+      content: "現在は配役を変更できません。",
+      ephemeral: true,
+    });
+    return;
+  }
+  const role = roleFromConfigurableToken(interaction.values[0]);
+  if (!role) {
+    await interaction.reply({ content: "役職を選び直してください。", ephemeral: true });
+    return;
+  }
+  await interaction.update(roleConfigPanel(game, role));
 }
 
 async function handleRoleConfigButton(
@@ -1745,11 +1906,8 @@ async function handleRoleConfigAdjust(
     return;
   }
 
-  const match =
-    /^role-(decrease|increase)-(wolf|madman|seer|guard|medium)$/.exec(action);
-  const configRole = CONFIGURABLE_ROLES.find(
-    (item) => item.action === match?.[2],
-  );
+  const match = /^role-(decrease|increase)-([0-9a-z]+)$/.exec(action);
+  const configRole = roleFromConfigurableToken(match?.[2] ?? "");
   if (!match || !configRole) {
     await interaction.reply({
       content: "その設定は変更できません。",
@@ -1758,22 +1916,15 @@ async function handleRoleConfigAdjust(
     return;
   }
 
+  const step = roleCountStep(configRole);
   const nextCount =
-    game.roleConfig[configRole.role] + (match[1] === "increase" ? 1 : -1);
+    game.roleConfig[configRole] + (match[1] === "increase" ? step : -step);
   try {
-    const roles = buildCustomRoles(
-      game.targetPlayerCount,
-      {
-        人狼: configRole.role === "人狼" ? nextCount : game.roleConfig.人狼,
-        狂人: configRole.role === "狂人" ? nextCount : game.roleConfig.狂人,
-        占い師:
-          configRole.role === "占い師" ? nextCount : game.roleConfig.占い師,
-        騎士: configRole.role === "騎士" ? nextCount : game.roleConfig.騎士,
-        霊能者:
-          configRole.role === "霊能者" ? nextCount : game.roleConfig.霊能者,
-      },
-      { unrestricted: isBetaTester(game.hostId) },
-    );
+    const proposed = configurableRoleCounts(game.roleConfig);
+    proposed[configRole] = nextCount;
+    const roles = buildCustomRoles(game.targetPlayerCount, proposed, {
+      unrestricted: isBetaTester(game.hostId),
+    });
     game.roleConfig = roleConfigFromRoles(roles);
   } catch (error) {
     await interaction.reply({
@@ -1784,7 +1935,7 @@ async function handleRoleConfigAdjust(
     return;
   }
 
-  await interaction.update(roleConfigPanel(game));
+  await interaction.update(roleConfigPanel(game, configRole));
   await updateLobby(game);
 }
 
@@ -1871,11 +2022,20 @@ function recordSeerResult(
 }
 
 function initializeSeerResults(game: GameState): void {
+  game.openingDeathIds = [];
   for (const seer of game.players.filter(
     (player) => player.role === "占い師",
   )) {
-    const targets = game.players.filter((player) => player.id !== seer.id);
-    if (targets.length) recordSeerResult(game, seer.id, randomItem(targets));
+    const targets = game.players.filter(
+      (player) => player.alive && player.id !== seer.id,
+    );
+    if (!targets.length) continue;
+    const target = randomItem(targets);
+    recordSeerResult(game, seer.id, target);
+    if (target.role === "妖狐") {
+      target.alive = false;
+      game.openingDeathIds.push(target.id);
+    }
   }
 }
 
@@ -1883,12 +2043,21 @@ export function roleDmEmbed(game: GameState, player: Player): EmbedBuilder {
   const role = player.role as RoleName;
   const info = ROLE_INFO[role];
   const allies =
-    role === "人狼"
+    isActualWolfRole(role) || role === "狂信者"
       ? game.players
-          .filter((other) => other.role === "人狼" && other.id !== player.id)
+          .filter(
+            (other) => isActualWolfRole(other.role) && other.id !== player.id,
+          )
           .map((other) => safeName(other))
+      : role === "共有者"
+        ? game.players
+            .filter(
+              (other) => other.role === "共有者" && other.id !== player.id,
+            )
+            .map((other) => safeName(other))
       : [];
-  const allyText = allies.length ? `\n仲間の人狼: ${allies.join("、")}` : "";
+  const allyLabel = role === "共有者" ? "共有者の相方" : "人狼";
+  const allyText = allies.length ? `\n${allyLabel}: ${allies.join("、")}` : "";
   const firstResult = game.seerResults.get(player.id)?.[0];
   const firstTarget = firstResult
     ? game.players.find((target) => target.id === firstResult.targetId)
@@ -1897,16 +2066,33 @@ export function roleDmEmbed(game: GameState, player: Player): EmbedBuilder {
     role === "占い師" && firstResult && firstTarget
       ? `\n\n🔮 初日の占い結果: **${safeName(firstTarget)}** は **${firstResult.isWolf ? "人狼" : "人間"}** です。`
       : "";
+  const winCondition =
+    role === "妖狐"
+      ? "決着時まで生存して妖狐陣営で勝利する"
+      : role === "キューピッド"
+        ? "結んだ恋人2人を生存させる"
+        : role === "純愛者"
+          ? "選んだ想い人を生存・勝利させる"
+          : role === "てるてる"
+            ? "投票で自分が処刑される"
+            : info.team === "wolf"
+              ? "人狼陣営を勝利させる"
+              : "人狼を全員処刑する";
 
   return new EmbedBuilder()
     .setTitle(`${info.icon} 役職｜${role}`)
     .setDescription(`${info.description}${allyText}${firstResultText}`)
     .addFields({
       name: "勝利条件",
-      value:
-        info.team === "wolf" ? "人狼陣営を勝利させる" : "人狼を全員処刑する",
+      value: winCondition,
     })
-    .setColor(info.team === "wolf" ? COLORS.danger : COLORS.lobby);
+    .setColor(
+      info.team === "wolf"
+        ? COLORS.danger
+        : info.team === "third"
+          ? COLORS.vote
+          : COLORS.lobby,
+    );
 }
 
 export function gameStartEmbed(game: GameState): EmbedBuilder {
@@ -1943,6 +2129,7 @@ async function startGame(game: GameState): Promise<void> {
     });
     game.day = 1;
     game.seerResults.clear();
+    game.openingDeathIds = [];
     game.roleDmSent.clear();
     game.voteHistory = [];
     game.npcClaims = [];
@@ -1955,6 +2142,14 @@ async function startGame(game: GameState): Promise<void> {
     game.nightHistory = [];
     game.postgameRecapState = "idle";
     game.wolfChatCounts.clear();
+    game.loverPairs = [];
+    game.devoteeTargets = new Map();
+    game.usedRolePowers = new Set();
+    game.fatalWoundIds = new Set();
+    game.pendingDivision = undefined;
+    game.divisionGroups = new Map();
+    game.loquaciousMissions = new Map();
+    game.loquaciousCompleted = new Set();
     game.pendingDmMessages.clear();
     game.analyticsSessionId ??= randomUUID();
     // 匿名プレイ分析と戦績を、同じ試合IDから直接結合できないよう分離する。
@@ -2790,6 +2985,78 @@ async function handleClaimResult(
   );
 }
 
+async function prepareDayRoleEffects(game: GameState): Promise<void> {
+  game.divisionGroups = new Map();
+  if (game.pendingDivision?.day === game.day) {
+    const living = shuffle(alivePlayers(game));
+    living.forEach((player, index) =>
+      game.divisionGroups?.set(player.id, index % 2 === 0 ? "A" : "B"),
+    );
+    const targetGroup = game.divisionGroups.get(game.pendingDivision.targetId);
+    if (targetGroup === "A" && living.length > 1) {
+      const swap = living.find(
+        (player) => game.divisionGroups?.get(player.id) === "B",
+      );
+      if (swap) {
+        game.divisionGroups.set(game.pendingDivision.targetId, "B");
+        game.divisionGroups.set(swap.id, "A");
+      }
+    }
+    game.pendingDivision = undefined;
+  }
+
+  game.loquaciousMissions = new Map();
+  game.loquaciousCompleted = new Set();
+  await Promise.all(
+    alivePlayers(game)
+      .filter((player) => player.role === "饒舌な人狼")
+      .map(async (player) => {
+        const word = randomItem(LOQUACIOUS_WORDS);
+        loquaciousMissions(game).set(player.id, word);
+        if (player.isNpc) {
+          if (Math.random() < 0.9) loquaciousCompleted(game).add(player.id);
+          return;
+        }
+        if (!player.user) {
+          loquaciousCompleted(game).add(player.id);
+          return;
+        }
+        const sent = await player.user
+          .send({
+            embeds: [
+              new EmbedBuilder()
+                .setTitle("🗣️ 饒舌ミッション")
+                .setDescription(
+                  `今日のお題は **「${word}」** です。下のボタンを押すと、お題を含む発言を公開できます。夜までに達成できないと死亡します。`,
+                )
+                .setColor(COLORS.danger),
+            ],
+            components: [
+              new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder()
+                  .setCustomId(componentId("loquacious-complete", game))
+                  .setLabel("お題を発言する")
+                  .setStyle(ButtonStyle.Primary),
+              ),
+            ],
+          })
+          .then(
+            () => true,
+            () => false,
+          );
+        if (!sent) {
+          // DM不達だけを理由に突然死させない。
+          loquaciousCompleted(game).add(player.id);
+          queuePrivateNotice(
+            game,
+            player.id,
+            `饒舌ミッションのお題は「${word}」でした。DM不達のため自動達成扱いです。`,
+          );
+        }
+      }),
+  );
+}
+
 async function startDay(game: GameState): Promise<void> {
   if (!isActiveGame(game)) return;
   clearGameTimers(game);
@@ -2804,6 +3071,8 @@ async function startDay(game: GameState): Promise<void> {
   game.resolutionQueued = false;
   game.phaseStartedAt = Date.now();
   await flushPendingDmMessages(game);
+  if (!isActiveGame(game)) return;
+  await prepareDayRoleEffects(game);
   if (!isActiveGame(game)) return;
 
   const living = alivePlayers(game);
@@ -2932,7 +3201,7 @@ function scheduleNpcDiscussion(game: GameState, daySeconds: number): void {
         game.day,
       );
       if (
-        (npc.role === "人狼" || npc.role === "狂人") &&
+        (isWolfTeamRole(npc.role) || npc.role === "てるてる") &&
         availableClaimDays(game, npc.id, "占い師").length > 0 &&
         (isContinuingSeerClaim || startsPlannedClaim)
       ) {
@@ -2944,8 +3213,8 @@ function scheduleNpcDiscussion(game: GameState, daySeconds: number): void {
         const publishedLines: string[] = [];
         for (const resultDay of claimDays) {
           const availableFakeTargets =
-            npc.role === "人狼"
-              ? targets.filter((target) => target.role !== "人狼")
+            npc.role !== "狂人"
+              ? targets.filter((target) => !isActualWolfRole(target.role))
               : targets;
           const claimedTargetIds = new Set(
             game.npcClaims
@@ -3144,6 +3413,60 @@ function randomItem<T>(items: T[]): T {
   return items[Math.floor(Math.random() * items.length)];
 }
 
+async function handleLoquaciousComplete(
+  interaction: ButtonInteraction,
+  game: GameState,
+  day: number,
+): Promise<void> {
+  const player = activeHumanPlayer(game, interaction.user.id);
+  const word = player ? loquaciousMissions(game).get(player.id) : undefined;
+  if (
+    game.phase !== "day" ||
+    game.day !== day ||
+    player?.role !== "饒舌な人狼" ||
+    !word
+  ) {
+    await interaction.reply({
+      content: "この饒舌ミッションは現在使用できません。",
+      ephemeral: true,
+    });
+    return;
+  }
+  if (loquaciousCompleted(game).has(player.id)) {
+    await interaction.reply({ content: "今日のお題は達成済みです。", ephemeral: true });
+    return;
+  }
+  loquaciousCompleted(game).add(player.id);
+  await interaction.update({
+    content: `✅ お題「${word}」を発言しました。`,
+    embeds: [],
+    components: [],
+  });
+  await game.channel.send(
+    `**${safeName(player)}**（プレイヤー）　今日は **${word}** を軸に考えたい。`,
+  );
+}
+
+export function eliminateWithLovers(
+  game: GameState,
+  player: Player | undefined,
+  deaths: Player[],
+): void {
+  if (!player?.alive) return;
+  player.alive = false;
+  deaths.push(player);
+  const pair = loverPairs(game).find(
+    ([left, right]) => left === player.id || right === player.id,
+  );
+  if (!pair) return;
+  const partnerId = pair[0] === player.id ? pair[1] : pair[0];
+  eliminateWithLovers(
+    game,
+    game.players.find((candidate) => candidate.id === partnerId),
+    deaths,
+  );
+}
+
 export function resolveWolfTarget(
   wolves: Player[],
   choices: ReadonlyMap<string, string>,
@@ -3164,7 +3487,7 @@ export function resolveWolfTarget(
 }
 
 export function voteTallyRows(game: GameState): string {
-  const rows = countVotes([...game.votes.values()]).map(({ id, count }) => {
+  const rows = countVotes(weightedVoteTargetIds(game)).map(({ id, count }) => {
     const player = game.players.find((candidate) => candidate.id === id);
     if (!player) return `不明：${count}票`;
     return `${player.isNpc ? "🤖" : "👤"} ${safeName(player)}：${count}票`;
@@ -3185,7 +3508,7 @@ export function voteBallotFields(
       const targetText = target
         ? `${target.isNpc ? "🤖" : "👤"} ${safeName(target)}`
         : "不明";
-      return `${voterText} → ${targetText}`;
+      return `${voterText}${voter.role === "市長" ? "（2票）" : ""} → ${targetText}`;
     });
   if (rows.length === 0) return [{ name: "投票先", value: "投票なし" }];
 
@@ -3197,6 +3520,15 @@ export function voteBallotFields(
     });
   }
   return fields;
+}
+
+export function weightedVoteTargetIds(
+  game: Pick<GameState, "players" | "votes">,
+): string[] {
+  return [...game.votes.entries()].flatMap(([voterId, targetId]) => {
+    const voter = game.players.find((player) => player.id === voterId);
+    return voter?.role === "市長" ? [targetId, targetId] : [targetId];
+  });
 }
 
 export function recordCurrentVoteRound(game: GameState): void {
@@ -3288,7 +3620,12 @@ async function handleSuspectOpen(
     });
     return;
   }
-  const targets = alivePlayers(game).filter((player) => player.id !== actor.id);
+  const actorGroup = game.divisionGroups?.get(actor.id);
+  const targets = alivePlayers(game).filter(
+    (player) =>
+      player.id !== actor.id &&
+      (!actorGroup || game.divisionGroups?.get(player.id) === actorGroup),
+  );
   if (targets.length === 0) {
     await interaction.reply({
       content: "指定できる相手がいません。",
@@ -3376,7 +3713,12 @@ async function handleNpcQuestionOpen(
     return;
   }
 
-  const npcs = alivePlayers(game).filter((player) => player.isNpc);
+  const actorGroup = game.divisionGroups?.get(actor.id);
+  const npcs = alivePlayers(game).filter(
+    (player) =>
+      player.isNpc &&
+      (!actorGroup || game.divisionGroups?.get(player.id) === actorGroup),
+  );
   if (npcs.length === 0) {
     await interaction.reply({
       content: "質問できるNPCがいません。",
@@ -3674,7 +4016,7 @@ async function revealVoteResult(game: GameState): Promise<void> {
   recordCurrentVoteRound(game);
 
   const living = alivePlayers(game);
-  const outcome = resolveVoteOutcome([...game.votes.values()], game.voteRound);
+  const outcome = resolveVoteOutcome(weightedVoteTargetIds(game), game.voteRound);
 
   if (outcome.kind === "revote") {
     game.phaseEndsAt = Date.now() + holdSeconds * 1000;
@@ -3738,10 +4080,17 @@ async function revealVoteResult(game: GameState): Promise<void> {
   );
   if (!executed) return;
 
-  executed.alive = false;
+  const deaths: Player[] = [];
+  eliminateWithLovers(game, executed, deaths);
+  if (executed.role === "猫又") {
+    const candidates = alivePlayers(game);
+    if (candidates.length > 0) {
+      eliminateWithLovers(game, randomItem(candidates), deaths);
+    }
+  }
   game.lastExecuted = executed;
   game.executionHistory.push(executed);
-  const winner = getWinner(game.players);
+  const winner = executed.role === "てるてる" ? "teruteru" : winnerFor(game);
   game.phaseEndsAt = Date.now() + holdSeconds * 1000;
   if (
     !(await updateOrReplacePhasePanel(game, {
@@ -3749,7 +4098,7 @@ async function revealVoteResult(game: GameState): Promise<void> {
         new EmbedBuilder()
           .setTitle(`${game.day}日目｜投票結果`)
           .setDescription(
-            `村の決定により、**${safeName(executed)}** が処刑されました。`,
+            `村の決定により、**${safeName(executed)}** が処刑されました。${deaths.length > 1 ? `\n${deaths.slice(1).map((player) => `**${safeName(player)}** が道連れになりました。`).join("\n")}` : ""}`,
           )
           .addFields(
             { name: "得票数", value: voteTallyRows(game) },
@@ -3779,7 +4128,7 @@ export function livingHumanWolfAllies(
       player.id !== playerId &&
       player.alive &&
       !player.isNpc &&
-      player.role === "人狼",
+      isActualWolfRole(player.role),
   );
 }
 
@@ -3800,7 +4149,7 @@ export function wolfChatButtonRow(
   if (
     !player.alive ||
     player.isNpc ||
-    player.role !== "人狼" ||
+    !isActualWolfRole(player.role) ||
     livingHumanWolfAllies(game, player.id).length === 0
   )
     return undefined;
@@ -3830,6 +4179,7 @@ export function recordNightHistory(
   game: GameState,
   attackTargetId: string | undefined,
   guarded: boolean,
+  deathIds: string[] = [],
 ): void {
   const choicesFor = (action: string, role: RoleName) =>
     game.players.flatMap((player) => {
@@ -3837,13 +4187,32 @@ export function recordNightHistory(
       const targetId = game.nightChoices.get(nightActionKey(action, player.id));
       return targetId ? [{ actorId: player.id, targetId }] : [];
     });
+  const wolfChoices = game.players.flatMap((player) => {
+    if (!player.alive || !isActualWolfRole(player.role)) return [];
+    const targetId = game.nightChoices.get(nightActionKey("kill", player.id));
+    return targetId ? [{ actorId: player.id, targetId }] : [];
+  });
   const entry = {
     day: game.day,
-    wolfChoices: choicesFor("kill", "人狼"),
+    wolfChoices,
     guardChoices: choicesFor("guard", "騎士"),
     seerChoices: choicesFor("seer", "占い師"),
+    specialChoices: [...game.nightChoices.entries()].flatMap(
+      ([key, targetValue]) => {
+        const separator = key.indexOf(":");
+        const action = key.slice(0, separator);
+        const actorId = key.slice(separator + 1);
+        if (
+          ["kill", "guard", "seer"].includes(action) ||
+          targetValue === "skip"
+        )
+          return [];
+        return [{ action, actorId, targetIds: targetValue.split(",") }];
+      },
+    ),
     attackTargetId,
-    victimId: attackTargetId && !guarded ? attackTargetId : undefined,
+    victimId: deathIds.includes(attackTargetId ?? "") ? attackTargetId : undefined,
+    deathIds,
     guarded,
   };
   const existingIndex = game.nightHistory.findIndex(
@@ -3853,15 +4222,84 @@ export function recordNightHistory(
   else game.nightHistory.push(entry);
 }
 
+type NightAction =
+  | "kill"
+  | "seer"
+  | "guard"
+  | "flee"
+  | "assassinate"
+  | "sorcery"
+  | "divide"
+  | "compass"
+  | "cupid"
+  | "devotee"
+  | "thief";
+
+const NIGHT_ACTION_ROLE: Record<Exclude<NightAction, "kill">, RoleName> = {
+  seer: "占い師",
+  guard: "騎士",
+  flee: "逃亡者",
+  assassinate: "暗殺者",
+  sorcery: "妖術師",
+  divide: "分断者",
+  compass: "方位磁針",
+  cupid: "キューピッド",
+  devotee: "純愛者",
+  thief: "怪盗",
+};
+
+function powerUsedKey(action: NightAction, playerId: string): string {
+  return `${action}:${playerId}`;
+}
+
+export function nightActionForPlayer(
+  game: GameState,
+  player: Player,
+): NightAction | undefined {
+  if (isActualWolfRole(player.role)) return "kill";
+  const role = player.role;
+  if (!role) return undefined;
+  const action = (Object.entries(NIGHT_ACTION_ROLE) as Array<
+    [Exclude<NightAction, "kill">, RoleName]
+  >).find(([, requiredRole]) => requiredRole === role)?.[0];
+  if (!action) return undefined;
+  if (
+    ["cupid", "devotee", "thief"].includes(action) &&
+    game.day !== 1
+  )
+    return undefined;
+  if (action === "compass" && game.day < 2) return undefined;
+  if (
+    ["assassinate", "divide", "compass", "cupid", "devotee", "thief"].includes(
+      action,
+    ) &&
+    usedRolePowers(game).has(powerUsedKey(action, player.id))
+  )
+    return undefined;
+  return action;
+}
+
+function nightTargets(
+  game: GameState,
+  player: Player,
+  action: NightAction,
+): Player[] {
+  const living = alivePlayers(game);
+  if (action === "kill")
+    return living.filter((target) => !isActualWolfRole(target.role));
+  if (action === "cupid") return living;
+  if (action === "divide")
+    return living.filter(
+      (target) => target.id !== player.id && !isActualWolfRole(target.role),
+    );
+  return living.filter((target) => target.id !== player.id);
+}
+
 function expectedNightActions(game: GameState): string[] {
   const expected: string[] = [];
   for (const player of alivePlayers(game)) {
-    if (player.role === "人狼")
-      expected.push(nightActionKey("kill", player.id));
-    if (player.role === "占い師")
-      expected.push(nightActionKey("seer", player.id));
-    if (player.role === "騎士")
-      expected.push(nightActionKey("guard", player.id));
+    const action = nightActionForPlayer(game, player);
+    if (action) expected.push(nightActionKey(action, player.id));
   }
   return expected;
 }
@@ -3869,9 +4307,10 @@ function expectedNightActions(game: GameState): string[] {
 async function sendNightMenu(
   game: GameState,
   player: Player,
-  action: "kill" | "seer" | "guard",
+  action: NightAction,
   prompt: string,
   targets: Player[],
+  options: { targetCount?: number; allowSkip?: boolean } = {},
 ): Promise<boolean> {
   if (
     !isActiveGame(game) ||
@@ -3883,7 +4322,14 @@ async function sendNightMenu(
   const menu = new StringSelectMenuBuilder()
     .setCustomId(componentId(`night-${action}`, game))
     .setPlaceholder(prompt)
-    .addOptions(playerOptions(targets));
+    .setMinValues(options.targetCount ?? 1)
+    .setMaxValues(options.targetCount ?? 1)
+    .addOptions([
+      ...playerOptions(targets),
+      ...(options.allowSkip
+        ? [{ label: "今夜は能力を使わない", value: "skip", emoji: "⏭️" }]
+        : []),
+    ]);
 
   const components: Array<
     ActionRowBuilder<StringSelectMenuBuilder> | ActionRowBuilder<ButtonBuilder>
@@ -3896,13 +4342,19 @@ async function sendNightMenu(
     const message = await player.user.send({
       embeds: [
         new EmbedBuilder()
-          .setTitle(
-            action === "kill"
-              ? "🌙 夜の行動｜襲撃"
-              : action === "seer"
-                ? "🌙 夜の行動｜占い"
-                : "🌙 夜の行動｜護衛",
-          )
+          .setTitle(`🌙 夜の行動｜${({
+            kill: "襲撃",
+            seer: "占い",
+            guard: "護衛",
+            flee: "逃亡",
+            assassinate: "暗殺",
+            sorcery: "妖術",
+            divide: "分断",
+            compass: "方位磁針",
+            cupid: "恋人選択",
+            devotee: "想い人選択",
+            thief: "役職を盗む",
+          } satisfies Record<NightAction, string>)[action]}`)
           .setDescription(
             chatRow
               ? `${prompt}\n\n「人狼会議」から、生存中の人狼仲間だけに短文を送れます。`
@@ -3927,7 +4379,7 @@ function activeHumanWolf(game: GameState, userId: string): Player | undefined {
       player.id === userId &&
       player.alive &&
       !player.isNpc &&
-      player.role === "人狼",
+      isActualWolfRole(player.role),
   );
 }
 
@@ -4148,15 +4600,38 @@ export async function sendMediumResults(game: GameState): Promise<void> {
 function automaticNightNotice(
   game: GameState,
   player: Player,
-  action: "kill" | "seer" | "guard",
+  action: NightAction,
 ): string {
   const targetId = game.nightChoices.get(nightActionKey(action, player.id));
-  const target = game.players.find((candidate) => candidate.id === targetId);
+  if (targetId === "skip") return "今夜は能力を使いませんでした。";
+  const targetIds = targetId?.split(",") ?? [];
+  const targets = targetIds.flatMap((id) => {
+    const target = game.players.find((candidate) => candidate.id === id);
+    return target ? [target] : [];
+  });
+  const target = targets[0];
   if (!target) return "夜行動は対象を選べず、見送りになりました。";
   if (action === "seer") {
     return `占いは **${safeName(target)}** が自動選択され、結果は **${publicResultForRole(target.role)}** でした。`;
   }
-  return `${action === "kill" ? "襲撃" : "護衛"}は **${safeName(target)}** が自動選択されました。`;
+  if (action === "sorcery")
+    return `妖術は **${safeName(target)}** が自動選択され、正体は **${target.role}** でした。`;
+  if (action === "compass" && targets.length === 2)
+    return `方位磁針は **${safeName(targets[0])}** と **${safeName(targets[1])}** を自動選択しました。`;
+  const labels: Record<NightAction, string> = {
+    kill: "襲撃",
+    seer: "占い",
+    guard: "護衛",
+    flee: "逃亡先",
+    assassinate: "暗殺",
+    sorcery: "妖術",
+    divide: "分断対象",
+    compass: "方位磁針",
+    cupid: "恋人",
+    devotee: "想い人",
+    thief: "怪盗の対象",
+  };
+  return `${labels[action]}は **${targets.map(safeName).join("** と **")}** が自動選択されました。`;
 }
 
 function strategicNightTarget(
@@ -4171,26 +4646,44 @@ function strategicNightTarget(
 
 function setNpcNightChoices(game: GameState): void {
   const living = alivePlayers(game);
-  const wolfTargets = living.filter((player) => player.role !== "人狼");
+  const wolfTargets = living.filter((player) => !isActualWolfRole(player.role));
   const sharedWolfTarget = strategicNightTarget(game, "kill", wolfTargets);
   for (const npc of living.filter((player) => player.isNpc)) {
-    if (npc.role === "人狼") {
+    const action = nightActionForPlayer(game, npc);
+    if (!action) continue;
+    if (action === "kill") {
       if (sharedWolfTarget)
         game.nightChoices.set(
           nightActionKey("kill", npc.id),
           sharedWolfTarget.id,
         );
-    } else if (npc.role === "占い師") {
+    } else if (action === "seer") {
       const target = nextNpcSeerTarget(game, npc);
       if (target) {
         game.nightChoices.set(nightActionKey("seer", npc.id), target.id);
         recordSeerResult(game, npc.id, target);
       }
-    } else if (npc.role === "騎士") {
+    } else if (action === "guard") {
       const targets = living.filter((player) => player.id !== npc.id);
       const target = strategicNightTarget(game, "guard", targets);
       if (target)
         game.nightChoices.set(nightActionKey("guard", npc.id), target.id);
+    } else if (action === "assassinate") {
+      const targets = nightTargets(game, npc, action);
+      const shouldUse = game.day >= 2 && Math.random() < 0.25;
+      game.nightChoices.set(
+        nightActionKey(action, npc.id),
+        shouldUse && targets.length ? randomItem(targets).id : "skip",
+      );
+    } else if (action === "divide") {
+      const targets = nightTargets(game, npc, action);
+      const shouldUse = game.day >= 2 && Math.random() < 0.3;
+      game.nightChoices.set(
+        nightActionKey(action, npc.id),
+        shouldUse && targets.length ? randomItem(targets).id : "skip",
+      );
+    } else {
+      fillMissingNightAction(game, npc, action);
     }
   }
 }
@@ -4198,11 +4691,10 @@ function setNpcNightChoices(game: GameState): void {
 export function fillMissingNightAction(
   game: GameState,
   player: Player,
-  action: "kill" | "seer" | "guard",
+  action: NightAction,
 ): void {
   const key = nightActionKey(action, player.id);
   if (game.nightChoices.has(key)) return;
-  const living = alivePlayers(game);
   if (action === "seer") {
     const target = nextNpcSeerTarget(game, player);
     if (target) {
@@ -4211,10 +4703,23 @@ export function fillMissingNightAction(
     }
     return;
   }
-  const targets = living.filter((target) =>
-    action === "kill" ? target.role !== "人狼" : target.id !== player.id,
-  );
-  const target = strategicNightTarget(game, action, targets);
+  if (action === "assassinate" || action === "divide") {
+    game.nightChoices.set(key, "skip");
+    return;
+  }
+  const targets = nightTargets(game, player, action);
+  if ((action === "cupid" || action === "compass") && targets.length >= 2) {
+    const first = randomItem(targets);
+    const second = randomItem(targets.filter((target) => target.id !== first.id));
+    game.nightChoices.set(key, `${first.id},${second.id}`);
+    return;
+  }
+  const target =
+    action === "kill" || action === "guard"
+      ? strategicNightTarget(game, action, targets)
+      : targets.length
+        ? randomItem(targets)
+        : undefined;
   if (target) game.nightChoices.set(key, target.id);
 }
 
@@ -4257,9 +4762,8 @@ async function autoCompleteHumanSeer(
 
 function fillAllMissingNightActions(game: GameState): void {
   for (const player of alivePlayers(game)) {
-    if (player.role === "人狼") fillMissingNightAction(game, player, "kill");
-    if (player.role === "占い師") fillMissingNightAction(game, player, "seer");
-    if (player.role === "騎士") fillMissingNightAction(game, player, "guard");
+    const action = nightActionForPlayer(game, player);
+    if (action) fillMissingNightAction(game, player, action);
   }
 }
 
@@ -4294,58 +4798,41 @@ async function startNight(game: GameState): Promise<void> {
   await Promise.all(
     living.map(async (player) => {
       if (player.isNpc) return;
-      if (player.role === "人狼") {
-        const sent = await sendNightMenu(
+      const action = nightActionForPlayer(game, player);
+      if (!action) return;
+      const prompt: Record<NightAction, string> = {
+        kill: "襲撃する人を選んでください。",
+        seer: `${seerAutoSeconds}秒以内に選ばなければ、未占いの相手から自動で占います。`,
+        guard: "守る人を選んでください。同じ相手も続けて護衛できます。",
+        flee: "今夜、逃げ込む相手を選んでください。",
+        assassinate: "一度だけ暗殺できます。使わないこともできます。",
+        sorcery: "正体を見抜く相手を選んでください。",
+        divide: "翌日の議論を分断する対象を選ぶか、今夜は見送ってください。",
+        compass: "陣営を比較する2人を選んでください。",
+        cupid: "恋人にする2人を選んでください。自分を含めても構いません。",
+        devotee: "想い人を1人選んでください。",
+        thief: "役職を盗む相手を1人選んでください。",
+      };
+      const sent = await sendNightMenu(
+        game,
+        player,
+        action,
+        prompt[action],
+        nightTargets(game, player, action),
+        {
+          targetCount:
+            action === "cupid" || action === "compass" ? 2 : 1,
+          allowSkip: action === "assassinate" || action === "divide",
+        },
+      );
+      if (!sent) {
+        fillMissingNightAction(game, player, action);
+        queuePrivateNotice(
           game,
-          player,
-          "kill",
-          "襲撃する人を選んでください。",
-          living.filter((target) => target.role !== "人狼"),
+          player.id,
+          automaticNightNotice(game, player, action),
         );
-        if (!sent) {
-          fillMissingNightAction(game, player, "kill");
-          queuePrivateNotice(
-            game,
-            player.id,
-            automaticNightNotice(game, player, "kill"),
-          );
-          nightDmFailureCount += 1;
-        }
-      } else if (player.role === "占い師") {
-        const sent = await sendNightMenu(
-          game,
-          player,
-          "seer",
-          `${seerAutoSeconds}秒以内に選ばなければ、未占いの相手から自動で占います。`,
-          living.filter((target) => target.id !== player.id),
-        );
-        if (!sent) {
-          fillMissingNightAction(game, player, "seer");
-          queuePrivateNotice(
-            game,
-            player.id,
-            automaticNightNotice(game, player, "seer"),
-          );
-          nightDmFailureCount += 1;
-        }
-      } else if (player.role === "騎士") {
-        const guardTargets = living.filter((target) => target.id !== player.id);
-        const sent = await sendNightMenu(
-          game,
-          player,
-          "guard",
-          "守る人を選んでください。同じ相手も続けて護衛できます。",
-          guardTargets,
-        );
-        if (!sent) {
-          fillMissingNightAction(game, player, "guard");
-          queuePrivateNotice(
-            game,
-            player.id,
-            automaticNightNotice(game, player, "guard"),
-          );
-          nightDmFailureCount += 1;
-        }
+        nightDmFailureCount += 1;
       }
     }),
   );
@@ -4374,24 +4861,18 @@ async function startNight(game: GameState): Promise<void> {
 async function handleNightAction(
   interaction: StringSelectMenuInteraction,
   game: GameState,
-  action: "kill" | "seer" | "guard",
+  action: NightAction,
   day: number,
 ): Promise<void> {
   const actor = game.players.find(
     (player) => player.id === interaction.user.id,
   );
-  const requiredRole: Record<typeof action, RoleName> = {
-    kill: "人狼",
-    seer: "占い師",
-    guard: "騎士",
-  };
-
   if (
     game.phase !== "night" ||
     game.resolving ||
     game.day !== day ||
     !actor?.alive ||
-    actor.role !== requiredRole[action]
+    nightActionForPlayer(game, actor) !== action
   ) {
     await interaction.reply({
       content: "この夜行動は現在使用できません。",
@@ -4401,41 +4882,54 @@ async function handleNightAction(
   }
 
   const actionKey = nightActionKey(action, actor.id);
-  if (action === "seer" && game.nightChoices.has(actionKey)) {
+  if (
+    (action === "seer" || action === "sorcery" || action === "compass") &&
+    game.nightChoices.has(actionKey)
+  ) {
     await interaction.reply({
-      content: "今夜の占いはすでに確定しています。",
+      content: "今夜の結果確認はすでに確定しています。",
       ephemeral: true,
     });
     return;
   }
 
-  const targetId = interaction.values[0];
-  const target = game.players.find(
-    (player) => player.id === targetId && player.alive,
+  if (interaction.values[0] === "skip") {
+    if (action !== "assassinate" && action !== "divide") {
+      await interaction.reply({ content: "この能力は見送れません。", ephemeral: true });
+      return;
+    }
+    game.nightChoices.set(actionKey, "skip");
+    await interaction.update({ content: "今夜は能力を使いません。", components: [] });
+    if (expectedNightActions(game).every((key) => game.nightChoices.has(key)))
+      queueNightResolutionAfterMinimum(game);
+    return;
+  }
+
+  const expectedTargetCount =
+    action === "cupid" || action === "compass" ? 2 : 1;
+  const targetIds = [...new Set(interaction.values)];
+  const allowedIds = new Set(
+    nightTargets(game, actor, action).map((target) => target.id),
   );
-  if (!target) {
+  const targets = targetIds.flatMap((targetId) => {
+    const target = game.players.find(
+      (player) => player.id === targetId && player.alive,
+    );
+    return target ? [target] : [];
+  });
+  if (
+    targets.length !== expectedTargetCount ||
+    targets.some((target) => !allowedIds.has(target.id))
+  ) {
     await interaction.reply({
-      content: "対象が見つかりません。",
+      content: "対象を選び直してください。",
       ephemeral: true,
     });
     return;
   }
 
-  if (action === "kill" && target.role === "人狼") {
-    await interaction.reply({
-      content: "仲間の人狼は襲撃できません。",
-      ephemeral: true,
-    });
-    return;
-  }
-  if ((action === "seer" || action === "guard") && target.id === actor.id) {
-    await interaction.reply({
-      content: "自分自身は選べません。",
-      ephemeral: true,
-    });
-    return;
-  }
-  game.nightChoices.set(actionKey, target.id);
+  const target = targets[0];
+  game.nightChoices.set(actionKey, targets.map((item) => item.id).join(","));
 
   if (action === "seer") {
     recordSeerResult(game, actor.id, target);
@@ -4444,9 +4938,20 @@ async function handleNightAction(
       content: `🔮 **${safeName(target)}** は **${result}** です。`,
       components: [],
     });
+  } else if (action === "sorcery") {
+    await interaction.update({
+      content: `🪄 **${safeName(target)}** の正体は **${target.role}** です。`,
+      components: [],
+    });
+  } else if (action === "compass") {
+    const sameTeam = effectivePlayerTeam(game, targets[0]) === effectivePlayerTeam(game, targets[1]);
+    await interaction.update({
+      content: `🧭 **${safeName(targets[0])}** と **${safeName(targets[1])}** は **${sameTeam ? "同じ陣営" : "別陣営"}** です。`,
+      components: [],
+    });
   } else {
     await interaction.update({
-      content: `選択しました：**${safeName(target)}**\n締切までは変更できます。`,
+      content: `選択しました：**${targets.map(safeName).join("** と **")}**\n締切までは変更できます。`,
       components: interaction.message.components.map((row) => row.toJSON()),
     });
   }
@@ -4510,14 +5015,134 @@ async function queueNightResolution(game: GameState): Promise<void> {
   schedule(game, revealSeconds * 1000, () => revealNightResult(game));
 }
 
+async function sendPrivateText(
+  game: GameState,
+  player: Player | undefined,
+  text: string,
+): Promise<void> {
+  if (!player || player.isNpc) return;
+  const sent = player.user
+    ? await player.user.send(text).then(
+        () => true,
+        () => false,
+      )
+    : false;
+  if (!sent) queuePrivateNotice(game, player.id, text);
+}
+
+async function resolveRelationshipAndUtilityActions(
+  game: GameState,
+): Promise<void> {
+  const choice = (action: NightAction, player: Player) =>
+    game.nightChoices.get(nightActionKey(action, player.id));
+
+  for (const cupid of game.players.filter(
+    (player) => player.alive && player.role === "キューピッド",
+  )) {
+    const selected = choice("cupid", cupid)?.split(",") ?? [];
+    if (selected.length !== 2) continue;
+    const [left, right] = selected;
+    if (
+      loverPairs(game).some((pair) =>
+        pair.some((playerId) => playerId === left || playerId === right),
+      )
+    )
+      continue;
+    loverPairs(game).push([left, right]);
+    usedRolePowers(game).add(powerUsedKey("cupid", cupid.id));
+    const leftPlayer = game.players.find((player) => player.id === left);
+    const rightPlayer = game.players.find((player) => player.id === right);
+    await Promise.all([
+      sendPrivateText(
+        game,
+        leftPlayer,
+        `💘 あなたは **${rightPlayer ? safeName(rightPlayer) : "不明"}** と恋人になりました。相手が死亡すると、あなたも後を追います。`,
+      ),
+      sendPrivateText(
+        game,
+        rightPlayer,
+        `💘 あなたは **${leftPlayer ? safeName(leftPlayer) : "不明"}** と恋人になりました。相手が死亡すると、あなたも後を追います。`,
+      ),
+    ]);
+  }
+
+  for (const devotee of game.players.filter(
+    (player) => player.alive && player.role === "純愛者",
+  )) {
+    const targetId = choice("devotee", devotee);
+    if (!targetId) continue;
+    devoteeTargets(game).set(devotee.id, targetId);
+    usedRolePowers(game).add(powerUsedKey("devotee", devotee.id));
+  }
+
+  for (const divider of game.players.filter(
+    (player) => player.alive && player.role === "分断者",
+  )) {
+    const targetId = choice("divide", divider);
+    if (!targetId || targetId === "skip") continue;
+    game.pendingDivision = { targetId, day: game.day + 1 };
+    usedRolePowers(game).add(powerUsedKey("divide", divider.id));
+  }
+
+  for (const compass of game.players.filter(
+    (player) => player.alive && player.role === "方位磁針",
+  )) {
+    if (!choice("compass", compass)) continue;
+    usedRolePowers(game).add(powerUsedKey("compass", compass.id));
+  }
+
+  for (const thief of game.players.filter(
+    (player) => player.alive && player.role === "怪盗",
+  )) {
+    const targetId = choice("thief", thief);
+    const target = game.players.find((player) => player.id === targetId);
+    if (!target?.role) continue;
+    const stolenRole = target.role;
+    target.role = "村人";
+    thief.role = stolenRole;
+    usedRolePowers(game).add(powerUsedKey("thief", thief.id));
+    await sendPrivateText(
+      game,
+      thief,
+      `🥷 **${safeName(target)}** から **${stolenRole}** を盗みました。あなたは今から **${stolenRole}** です。`,
+    );
+    await sendPrivateText(
+      game,
+      target,
+      "🥷 何者かに役職を盗まれました。あなたは今から **村人** です。",
+    );
+  }
+}
+
+async function sendCoronerReports(
+  game: GameState,
+  deaths: Player[],
+): Promise<void> {
+  if (deaths.length === 0) return;
+  const report = deaths
+    .map((player) => `・**${safeName(player)}**｜**${player.role}**`)
+    .join("\n");
+  await Promise.all(
+    game.players
+      .filter(
+        (player) => player.alive && player.role === "検死官" && !player.isNpc,
+      )
+      .map((coroner) =>
+        sendPrivateText(game, coroner, `🩺 **検死結果**\n${report}`),
+      ),
+  );
+}
+
 async function revealNightResult(game: GameState): Promise<void> {
   if (!isActiveGame(game) || game.phase !== "night" || !game.resolving) return;
   clearGameTimers(game);
   const holdSeconds = RESULT_HOLD_SECONDS;
 
   const living = alivePlayers(game);
-  const wolves = living.filter((player) => player.role === "人狼");
-  const possibleVictims = living.filter((player) => player.role !== "人狼");
+  const wolves = living.filter((player) => isActualWolfRole(player.role));
+  const possibleVictims = living.filter(
+    (player) => !isActualWolfRole(player.role),
+  );
   const victimId = resolveWolfTarget(
     wolves,
     game.nightChoices,
@@ -4526,27 +5151,125 @@ async function revealNightResult(game: GameState): Promise<void> {
   const victim = game.players.find((player) => player.id === victimId);
 
   const wasGuarded = isTargetGuarded(game, victim?.id);
-  recordNightHistory(game, victimId, wasGuarded);
+  const previousFatalWounds = new Set(fatalWoundIds(game));
+  const deaths: Player[] = [];
+  await resolveRelationshipAndUtilityActions(game);
+
+  let attackKilled: Player | undefined;
   if (victim && !wasGuarded) {
-    victim.alive = false;
+    if (victim.role === "妖狐") {
+      // 妖狐は襲撃では死亡しない。
+    } else if (victim.role === "呪われた村人") {
+      victim.role = "人狼";
+      const wolfAllies = alivePlayers(game).filter(
+        (player) => isActualWolfRole(player.role) && player.id !== victim.id,
+      );
+      await sendPrivateText(
+        game,
+        victim,
+        `🩸 呪いが発動しました。あなたは襲撃で死亡せず、**人狼** に変化しました。${wolfAllies.length ? `\n仲間の人狼：${wolfAllies.map(safeName).join("、")}` : ""}`,
+      );
+      await Promise.all(
+        wolfAllies.map((wolf) =>
+          sendPrivateText(
+            game,
+            wolf,
+            `🐺 **${safeName(victim)}** が呪いにより新しい人狼になりました。`,
+          ),
+        ),
+      );
+    } else if (victim.role === "タフガイ") {
+      fatalWoundIds(game).add(victim.id);
+      await sendPrivateText(
+        game,
+        victim,
+        "💪 人狼の襲撃に耐えました。しかし傷は深く、次の夜に死亡します。",
+      );
+    } else if (victim.role !== "逃亡者") {
+      eliminateWithLovers(game, victim, deaths);
+      attackKilled = victim;
+    }
   }
 
-  const winner = getWinner(game.players);
+  for (const playerId of previousFatalWounds) {
+    const player = game.players.find((candidate) => candidate.id === playerId);
+    eliminateWithLovers(game, player, deaths);
+    fatalWoundIds(game).delete(playerId);
+  }
+
+  for (const choiceEntry of [...game.nightChoices.entries()]) {
+    const [key, targetValue] = choiceEntry;
+    const [action, actorId] = key.split(":") as [NightAction, string];
+    if (action === "seer") {
+      const target = game.players.find((player) => player.id === targetValue);
+      if (target?.role === "妖狐") eliminateWithLovers(game, target, deaths);
+    }
+    if (action === "assassinate" && targetValue !== "skip") {
+      const assassin = game.players.find((player) => player.id === actorId);
+      const target = game.players.find((player) => player.id === targetValue);
+      if (!assassin || !target) continue;
+      usedRolePowers(game).add(powerUsedKey(action, assassin.id));
+      const friendlyFire =
+        target.role !== undefined && ROLE_INFO[target.role].team === "villager";
+      eliminateWithLovers(game, target, deaths);
+      if (friendlyFire) eliminateWithLovers(game, assassin, deaths);
+    }
+  }
+
+  for (const fugitive of game.players.filter(
+    (player) => player.alive && player.role === "逃亡者",
+  )) {
+    const hostId = game.nightChoices.get(nightActionKey("flee", fugitive.id));
+    const host = game.players.find((player) => player.id === hostId);
+    if (isActualWolfRole(host?.role) || host?.id === attackKilled?.id) {
+      eliminateWithLovers(game, fugitive, deaths);
+    }
+  }
+
+  for (const wolf of game.players.filter(
+    (player) => player.alive && player.role === "饒舌な人狼",
+  )) {
+    if (!loquaciousCompleted(game).has(wolf.id)) {
+      eliminateWithLovers(game, wolf, deaths);
+    }
+  }
+
+  if (attackKilled?.role === "猫又") {
+    const revengeTargets = alivePlayers(game).filter((player) =>
+      isActualWolfRole(player.role),
+    );
+    if (revengeTargets.length > 0)
+      eliminateWithLovers(game, randomItem(revengeTargets), deaths);
+  }
+
+  const uniqueDeaths = deaths.filter(
+    (player, index) => deaths.findIndex((item) => item.id === player.id) === index,
+  );
+  recordNightHistory(
+    game,
+    victimId,
+    wasGuarded,
+    uniqueDeaths.map((player) => player.id),
+  );
+  await sendCoronerReports(game, uniqueDeaths);
+
+  const winner = winnerFor(game);
   game.phaseEndsAt = Date.now() + holdSeconds * 1000;
-  const morningDescription = !victimId
-    ? "人狼の襲撃先がまとまらず、昨夜の犠牲者はいませんでした。"
-    : wasGuarded
-      ? "護衛が成功し、昨夜の犠牲者はいませんでした。"
-      : victim
-        ? `昨夜、**${safeName(victim)}** が襲撃されました。`
-        : "昨夜の犠牲者はいませんでした。";
+  const morningDescription =
+    uniqueDeaths.length > 0
+      ? `昨夜、${uniqueDeaths.map((player) => `**${safeName(player)}**`).join("、")} が死亡しました。`
+      : !victimId
+        ? "人狼の襲撃先がまとまらず、昨夜の犠牲者はいませんでした。"
+        : wasGuarded
+          ? "護衛が成功し、昨夜の犠牲者はいませんでした。"
+          : "昨夜の犠牲者はいませんでした。";
   if (
     !(await updateOrReplacePhasePanel(game, {
       embeds: [
         new EmbedBuilder()
           .setTitle(`${game.day}日目｜朝`)
           .setDescription(morningDescription)
-          .setColor(wasGuarded || !victim ? COLORS.success : COLORS.danger),
+          .setColor(uniqueDeaths.length === 0 ? COLORS.success : COLORS.danger),
       ],
       components: [],
     }))
@@ -4654,7 +5377,7 @@ function voteRecapLines(game: GameState, day: number): string[] {
     .flatMap((record) =>
       record.ballots.map(
         (ballot) =>
-          `${record.round === 1 ? "投票" : "再投票"}｜**${recapPlayerName(game, ballot.voterId)}** → **${recapPlayerName(game, ballot.targetId)}**`,
+          `${record.round === 1 ? "投票" : "再投票"}｜**${recapPlayerName(game, ballot.voterId)}**${recapPlayer(game, ballot.voterId)?.role === "市長" ? "（2票）" : ""} → **${recapPlayerName(game, ballot.targetId)}**`,
       ),
     );
 }
@@ -4665,7 +5388,11 @@ function voteResultRecapLine(game: GameState, day: number): string {
     .sort((left, right) => right.round - left.round)[0];
   if (!finalVote) return "投票記録なし";
   const outcome = resolveVoteOutcome(
-    finalVote.ballots.map((ballot) => ballot.targetId),
+    finalVote.ballots.flatMap((ballot) =>
+      recapPlayer(game, ballot.voterId)?.role === "市長"
+        ? [ballot.targetId, ballot.targetId]
+        : [ballot.targetId],
+    ),
     finalVote.round,
   );
   if (outcome.kind !== "execute") return "処刑なし";
@@ -4692,6 +5419,25 @@ function nightRecapLines(game: GameState, day: number): string[] {
     lines.push(
       `🔮 **${recapPlayerName(game, choice.actorId)}** → **${recapPlayerName(game, choice.targetId)}** は ${publicResultForRole(target?.role)}`,
     );
+  }
+  const specialLabels: Record<string, string> = {
+    flee: "🏃 逃亡",
+    assassinate: "🗡️ 暗殺",
+    sorcery: "🪄 妖術",
+    divide: "✂️ 分断",
+    compass: "🧭 方位磁針",
+    cupid: "💘 恋人選択",
+    devotee: "💝 想い人",
+    thief: "🥷 怪盗",
+  };
+  for (const choice of night.specialChoices ?? []) {
+    lines.push(
+      `${specialLabels[choice.action] ?? choice.action}｜**${recapPlayerName(game, choice.actorId)}** → ${choice.targetIds.map((targetId) => `**${recapPlayerName(game, targetId)}**`).join("・")}`,
+    );
+  }
+  for (const deathId of night.deathIds ?? []) {
+    const dead = recapPlayer(game, deathId);
+    if (dead) lines.push(`死亡｜**${safeName(dead)}**（${dead.role}）`);
   }
   if (!night.attackTargetId) lines.push("結果｜襲撃先がまとまらず、犠牲者なし");
   else if (night.guarded)
@@ -4812,6 +5558,64 @@ export function gameResultRow(
   return new ActionRowBuilder<ButtonBuilder>().addComponents(buttons);
 }
 
+function didPlayerWin(
+  game: GameState,
+  player: Player,
+  winner: Winner,
+  visited = new Set<string>(),
+): boolean {
+  const isLover = loverPairs(game).some((pair) => pair.includes(player.id));
+  if (isLover) return winner === "lovers";
+  if (player.role === "キューピッド") return winner === "lovers";
+  if (player.role === "妖狐") return winner === "fox";
+  if (player.role === "てるてる") return winner === "teruteru";
+  if (player.role === "純愛者" && !visited.has(player.id)) {
+    visited.add(player.id);
+    const targetId = devoteeTargets(game).get(player.id);
+    const target = game.players.find((candidate) => candidate.id === targetId);
+    return Boolean(
+      target?.alive && didPlayerWin(game, target, winner, visited),
+    );
+  }
+  return Boolean(player.role && ROLE_INFO[player.role].team === winner);
+}
+
+function winnerPresentation(winner: Winner): {
+  name: string;
+  line: string;
+  color: number;
+} {
+  if (winner === "villager")
+    return {
+      name: "村人陣営",
+      line: "村からすべての人狼を追放しました。",
+      color: COLORS.lobby,
+    };
+  if (winner === "wolf")
+    return {
+      name: "人狼陣営",
+      line: "人狼は最後まで正体を隠し通しました。",
+      color: COLORS.danger,
+    };
+  if (winner === "fox")
+    return {
+      name: "妖狐陣営",
+      line: "争いを生き抜いた妖狐が、勝利をさらいました。",
+      color: COLORS.vote,
+    };
+  if (winner === "lovers")
+    return {
+      name: "恋人陣営",
+      line: "最後まで生き残った恋人たちが、2人だけの勝利をつかみました。",
+      color: 0xeb459e,
+    };
+  return {
+    name: "てるてる",
+    line: "処刑されたてるてるが、狙いどおり単独勝利しました。",
+    color: COLORS.day,
+  };
+}
+
 async function endGame(game: GameState, winner: Winner): Promise<void> {
   if (!isActiveGame(game)) return;
   clearGameTimers(game);
@@ -4829,20 +5633,16 @@ async function endGame(game: GameState, winner: Winner): Promise<void> {
     };
     queueAnalytics(game, () => recordGameCompleted(analytics));
   }
-  const winnerText = winner === "villager" ? "村人陣営" : "人狼陣営";
+  const presentation = winnerPresentation(winner);
   const survivors = game.players.filter((player) => player.alive);
   const eliminated = game.players.filter((player) => !player.alive);
-  const resultLine =
-    winner === "villager"
-      ? "村からすべての人狼を追放しました。"
-      : "人狼は最後まで正体を隠し通しました。";
 
   const showFeedback = !game.analyticsFeedbackPromptShown;
   const row = gameResultRow(game, showFeedback);
 
   const endEmbed = new EmbedBuilder()
-    .setTitle(`ゲーム終了｜${winnerText}の勝利`)
-    .setDescription(resultLine)
+    .setTitle(`ゲーム終了｜${presentation.name}の勝利`)
+    .setDescription(presentation.line)
     .addFields(
       {
         name: `生存（${survivors.length}人）`,
@@ -4853,12 +5653,12 @@ async function endGame(game: GameState, winner: Winner): Promise<void> {
         value: roleRows(eliminated),
       },
     )
-    .setColor(winner === "villager" ? COLORS.lobby : COLORS.danger)
+    .setColor(presentation.color)
     .setFooter({ text: `${game.day}日目で決着` });
   if (usesUnrankedRoleConfig(game))
     endEmbed.addFields({
       name: "戦績",
-      value: "βテスター自由配役のため、記録対象外です。",
+      value: "カスタム配役のため、記録対象外です。",
     });
 
   const endPayload = {
@@ -4882,7 +5682,7 @@ async function endGame(game: GameState, winner: Winner): Promise<void> {
       userId: player.id,
       displayName: player.name,
       role: player.role,
-      won: ROLE_INFO[player.role].team === winner,
+      won: didPlayerWin(game, player, winner),
       survived: player.alive,
     }));
   const resultMessage = game.phaseMessage;
@@ -5179,6 +5979,14 @@ export function prepareRematchGame(
     executionHistory: [],
     nightHistory: [],
     wolfChatCounts: new Map(),
+    loverPairs: [],
+    devoteeTargets: new Map(),
+    usedRolePowers: new Set(),
+    fatalWoundIds: new Set(),
+    pendingDivision: undefined,
+    divisionGroups: new Map(),
+    loquaciousMissions: new Map(),
+    loquaciousCompleted: new Set(),
     votes: new Map(),
     nightChoices: new Map(),
     npcSuspicion: new Map(),
@@ -5191,6 +5999,7 @@ export function prepareRematchGame(
     humanSuspicions: new Map(),
     npcQuestionCounts: new Map(),
     seerResults: new Map(),
+    openingDeathIds: [],
     roleDmSent: new Set(),
     roleDmFailures: new Set(),
     pendingDmMessages: new Map(),
@@ -5357,6 +6166,8 @@ export async function handleComponent(
       await handleRoleConfigButton(interaction, game);
     else if (action.startsWith("role-"))
       await handleRoleConfigAdjust(interaction, game, action);
+    else if (action === "loquacious-complete")
+      await handleLoquaciousComplete(interaction, game, Number(dayText));
     else if (action === "claim")
       await handleClaimButton(interaction, game, Number(dayText));
     else if (action === "claim-quick-seer")
@@ -5422,6 +6233,8 @@ export async function handleComponent(
   const day = Number(dayText);
   if (action === "player-count")
     await handlePlayerCountChange(interaction, game);
+  else if (action === "role-config-select")
+    await handleRoleConfigSelect(interaction, game);
   else if (action === "claim-role")
     await handleClaimRole(interaction, game, day);
   else if (action.startsWith("claim-target-"))
@@ -5440,4 +6253,20 @@ export async function handleComponent(
     await handleNightAction(interaction, game, "seer", day);
   else if (action === "night-guard")
     await handleNightAction(interaction, game, "guard", day);
+  else if (action === "night-flee")
+    await handleNightAction(interaction, game, "flee", day);
+  else if (action === "night-assassinate")
+    await handleNightAction(interaction, game, "assassinate", day);
+  else if (action === "night-sorcery")
+    await handleNightAction(interaction, game, "sorcery", day);
+  else if (action === "night-divide")
+    await handleNightAction(interaction, game, "divide", day);
+  else if (action === "night-compass")
+    await handleNightAction(interaction, game, "compass", day);
+  else if (action === "night-cupid")
+    await handleNightAction(interaction, game, "cupid", day);
+  else if (action === "night-devotee")
+    await handleNightAction(interaction, game, "devotee", day);
+  else if (action === "night-thief")
+    await handleNightAction(interaction, game, "thief", day);
 }
