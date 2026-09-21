@@ -11,7 +11,13 @@ import {
 import * as dotenv from "dotenv";
 import { handleAdminAnalyticsCommand } from "./admin-analytics";
 import { recordGuildFunnelEvent } from "./analytics";
-import { createLobby, handleComponent, resetChannel } from "./game";
+import {
+  createLobby,
+  handleComponent,
+  handleGuildMessage,
+  recoverOrphanedDivisionChannels,
+  resetChannel,
+} from "./game";
 import { healthResponse } from "./health";
 import {
   guideCommand,
@@ -44,7 +50,12 @@ import {
 dotenv.config();
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
+  ],
   partials: [Partials.Channel],
 });
 
@@ -69,9 +80,7 @@ const commands = [
     .setName("ranking")
     .setDescription("公開ランキングへの参加設定を変更します")
     .addSubcommand((subcommand) =>
-      subcommand
-        .setName("join")
-        .setDescription("公開ランキングに参加します"),
+      subcommand.setName("join").setDescription("公開ランキングに参加します"),
     )
     .addSubcommand((subcommand) =>
       subcommand
@@ -81,6 +90,11 @@ const commands = [
 ].map((command) => command.toJSON());
 
 client.once(Events.ClientReady, async (readyClient) => {
+  const recoveredDivisions = await recoverOrphanedDivisionChannels(
+    readyClient.guilds.cache.values(),
+  );
+  if (recoveredDivisions > 0)
+    console.log(`Recovered ${recoveredDivisions} orphaned division(s).`);
   readyClient.user.setActivity("/jinro で人狼", {
     type: ActivityType.Playing,
   });
@@ -89,6 +103,8 @@ client.once(Events.ClientReady, async (readyClient) => {
   });
   console.log(`${readyClient.user.tag} is ready.`);
 });
+
+client.on(Events.MessageCreate, handleGuildMessage);
 
 client.on(Events.Error, (error) => {
   console.error("Discord client error:", error);

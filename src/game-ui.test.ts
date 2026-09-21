@@ -12,7 +12,10 @@ import {
   claimedRoleForPlayer,
   claimListEmbed,
   claimPanel,
+  completeLoquaciousMissionForMessage,
   dayEmbed,
+  divisionGroupsForPlayers,
+  divisionRecoverySnapshotFromTopic,
   eliminateWithLovers,
   finishedDayEmbed,
   fillMissingNightAction,
@@ -284,7 +287,8 @@ describe("ゲーム画面", () => {
     expect(componentJson).toContain("player-count");
     expect(componentJson).not.toContain("プリセット");
     expect(payload.embeds[0].toJSON().description).not.toContain("｜");
-    const playerCountId = payload.components[0].toJSON().components[0].custom_id;
+    const playerCountId =
+      payload.components[0].toJSON().components[0].custom_id;
     const parsed = parseGameComponentId(playerCountId ?? "");
     expect(parsed).toMatchObject({
       action: "player-count",
@@ -1544,6 +1548,48 @@ describe("ゲーム画面", () => {
     expect(game.npcMemory.get("2")?.get("1")).toBeCloseTo(0.9);
   });
 
+  it("分断中の議論画面には同じ部屋の参加者だけを表示する", () => {
+    const game = makeGame(["分断者", "人狼", "占い師", "村人"]);
+    game.divisionGroups = new Map([
+      ["0", "A"],
+      ["1", "A"],
+      ["2", "B"],
+      ["3", "B"],
+    ]);
+
+    const json = dayEmbed(game, "A").toJSON();
+    expect(json.fields?.[0].name).toBe("A組（2人）");
+    expect(json.fields?.[0].value).toContain("プレイヤー1");
+    expect(json.fields?.[0].value).not.toContain("プレイヤー2");
+  });
+
+  it("分断者と指定相手を同じ部屋に置き、人数を均等に分ける", () => {
+    const game = makeGame(["分断者", "人狼", "占い師", "騎士", "村人"]);
+    const groups = divisionGroupsForPlayers(game.players, "0", "3");
+
+    expect(groups.get("0")).toBe(groups.get("3"));
+    expect([...groups.values()].filter((group) => group === "A")).toHaveLength(
+      3,
+    );
+    expect([...groups.values()].filter((group) => group === "B")).toHaveLength(
+      2,
+    );
+  });
+
+  it("再起動後に分断前のチャンネル権限を復旧できる情報を解析する", () => {
+    const snapshot = divisionRecoverySnapshotFromTopic(
+      "jinrobot-division:v1:123456789012345678:123456789012345678.d,234567890123456789.i,345678901234567890.a",
+    );
+
+    expect(snapshot?.mainChannelId).toBe("123456789012345678");
+    expect([...(snapshot?.permissions.entries() ?? [])]).toEqual([
+      ["123456789012345678", "deny"],
+      ["234567890123456789", "inherit"],
+      ["345678901234567890", "allow"],
+    ]);
+    expect(divisionRecoverySnapshotFromTopic("unrelated")).toBeUndefined();
+  });
+
   it("市長の投票を2票として集計する", () => {
     const game = makeGame(["市長", "人狼", "占い師", "村人"]);
     game.votes.set("0", "1");
@@ -1579,11 +1625,59 @@ describe("ゲーム画面", () => {
     }
 
     const compassGame = makeGame(["方位磁針", "人狼", "占い師", "村人"]);
-    expect(nightActionForPlayer(compassGame, compassGame.players[0])).toBeUndefined();
+    expect(
+      nightActionForPlayer(compassGame, compassGame.players[0]),
+    ).toBeUndefined();
     compassGame.day = 2;
     expect(nightActionForPlayer(compassGame, compassGame.players[0])).toBe(
       "compass",
     );
+  });
+
+  it("饒舌な人狼は実際の議論メッセージにお題を含めると達成する", () => {
+    const game = makeGame(["饒舌な人狼", "占い師", "騎士", "村人"]);
+    game.loquaciousMissions = new Map([["0", "投票"]]);
+    game.loquaciousCompleted = new Set();
+
+    expect(
+      completeLoquaciousMissionForMessage(
+        game,
+        "0",
+        game.channelId,
+        "占い結果を見よう",
+      ),
+    ).toBeUndefined();
+    expect(
+      completeLoquaciousMissionForMessage(
+        game,
+        "0",
+        game.channelId,
+        "今日は投票先を考えよう",
+      ),
+    ).toBe("投票");
+    expect(
+      completeLoquaciousMissionForMessage(game, "0", game.channelId, "投票"),
+    ).toBeUndefined();
+  });
+
+  it("分断中の饒舌ミッションは本人の分断部屋での発言だけを数える", () => {
+    const game = makeGame(["饒舌な人狼", "占い師", "騎士", "村人"]);
+    game.loquaciousMissions = new Map([["0", "理由"]]);
+    game.loquaciousCompleted = new Set();
+    game.divisionGroups = new Map([["0", "A"]]);
+    game.divisionChannels = new Map([["A", { id: "sector-a" } as TextChannel]]);
+
+    expect(
+      completeLoquaciousMissionForMessage(
+        game,
+        "0",
+        game.channelId,
+        "理由を話す",
+      ),
+    ).toBeUndefined();
+    expect(
+      completeLoquaciousMissionForMessage(game, "0", "sector-a", "理由を話す"),
+    ).toBe("理由");
   });
 
   it("恋人の片方が死亡するともう片方も道連れになる", () => {
@@ -1597,9 +1691,9 @@ describe("ゲーム画面", () => {
 
   it("共有者と狂信者のDMには知っている仲間を表示する", () => {
     const shared = makeGame(["共有者", "共有者", "人狼", "村人"]);
-    expect(roleDmEmbed(shared, shared.players[0]).toJSON().description).toContain(
-      "共有者の相方: プレイヤー1",
-    );
+    expect(
+      roleDmEmbed(shared, shared.players[0]).toJSON().description,
+    ).toContain("共有者の相方: プレイヤー1");
 
     const fanatic = makeGame(["狂信者", "饒舌な人狼", "人狼", "村人"]);
     const description = roleDmEmbed(fanatic, fanatic.players[0]).toJSON()
@@ -1625,7 +1719,9 @@ describe("ゲーム画面", () => {
     game.players[1].isNpc = false;
 
     const row = wolfChatButtonRow(game, game.players[0]);
-    expect(JSON.stringify(row?.toJSON())).toContain("tb:wolf-chat-open:channel:");
+    expect(JSON.stringify(row?.toJSON())).toContain(
+      "tb:wolf-chat-open:channel:",
+    );
     expect(JSON.stringify(row?.toJSON())).toContain(":2");
     game.players[1].isNpc = true;
     expect(wolfChatButtonRow(game, game.players[0])).toBeUndefined();

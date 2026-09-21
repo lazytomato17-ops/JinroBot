@@ -12,7 +12,7 @@ import {
 
 export const GUIDE_SITE_URL = "https://tomatobot-web.onrender.com/#how-to-play";
 export const BOT_INVITE_URL =
-  "https://discord.com/oauth2/authorize?client_id=1442475786736242807&scope=bot%20applications.commands&permissions=17592186044416";
+  "https://discord.com/oauth2/authorize?client_id=1442475786736242807&scope=bot%20applications.commands&permissions=17592186129424";
 export const ONBOARDING_QUICK_START_BUTTON_ID =
   "tomatobot-onboarding-quick-start";
 

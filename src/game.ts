@@ -10,13 +10,14 @@ import {
   Message,
   ModalBuilder,
   ModalSubmitInteraction,
+  PermissionFlagsBits,
   StringSelectMenuBuilder,
   StringSelectMenuInteraction,
   TextChannel,
   TextInputBuilder,
   TextInputStyle,
 } from "discord.js";
-import type { MessageCreateOptions, User } from "discord.js";
+import type { Guild, MessageCreateOptions, User } from "discord.js";
 import { randomUUID } from "node:crypto";
 import { isBetaTester } from "./access";
 import {
@@ -116,6 +117,7 @@ const LOQUACIOUS_WORDS = [
   "対抗",
   "様子",
 ];
+const DIVISION_CHANNEL_TOPIC_PREFIX = "jinrobot-division:v1:";
 
 const games = new Map<string, GameState>();
 
@@ -397,6 +399,279 @@ function isActiveGame(game: GameState): boolean {
   return games.get(game.channelId) === game;
 }
 
+function gameForChannelId(channelId: string): GameState | undefined {
+  return (
+    games.get(channelId) ??
+    [...games.values()].find((game) =>
+      [...(game.divisionChannels?.values() ?? [])].some(
+        (channel) => channel.id === channelId,
+      ),
+    )
+  );
+}
+
+type ExplicitViewPermission = "allow" | "deny" | "inherit";
+
+interface DivisionRecoverySnapshot {
+  mainChannelId: string;
+  permissions: Map<string, ExplicitViewPermission>;
+}
+
+function divisionRecoveryTopic(
+  mainChannelId: string,
+  permissions: ReadonlyMap<string, ExplicitViewPermission>,
+): string {
+  const code = { allow: "a", deny: "d", inherit: "i" } as const;
+  const entries = [...permissions].map(
+    ([id, permission]) => `${id}.${code[permission]}`,
+  );
+  return `${DIVISION_CHANNEL_TOPIC_PREFIX}${mainChannelId}:${entries.join(",")}`;
+}
+
+export function divisionRecoverySnapshotFromTopic(
+  topic: string | null,
+): DivisionRecoverySnapshot | undefined {
+  if (!topic?.startsWith(DIVISION_CHANNEL_TOPIC_PREFIX)) return undefined;
+  const payload = topic.slice(DIVISION_CHANNEL_TOPIC_PREFIX.length);
+  const separator = payload.indexOf(":");
+  if (separator < 1) return undefined;
+  const mainChannelId = payload.slice(0, separator);
+  if (!/^\d+$/.test(mainChannelId)) return undefined;
+  const permissions = new Map<string, ExplicitViewPermission>();
+  const permissionCode: Record<string, ExplicitViewPermission> = {
+    a: "allow",
+    d: "deny",
+    i: "inherit",
+  };
+  for (const entry of payload.slice(separator + 1).split(",")) {
+    const [id, code] = entry.split(".");
+    const permission = permissionCode[code];
+    if (!/^\d+$/.test(id) || !permission) return undefined;
+    permissions.set(id, permission);
+  }
+  return permissions.size > 0 ? { mainChannelId, permissions } : undefined;
+}
+
+function explicitViewPermission(
+  channel: TextChannel,
+  overwriteId: string,
+): ExplicitViewPermission {
+  const overwrite = channel.permissionOverwrites.cache.get(overwriteId);
+  if (overwrite?.allow.has(PermissionFlagsBits.ViewChannel)) return "allow";
+  if (overwrite?.deny.has(PermissionFlagsBits.ViewChannel)) return "deny";
+  return "inherit";
+}
+
+function viewPermissionValue(
+  permission: ExplicitViewPermission,
+): boolean | null {
+  if (permission === "allow") return true;
+  if (permission === "deny") return false;
+  return null;
+}
+
+function divisionChannelForPlayer(
+  game: GameState,
+  player: Player,
+): TextChannel {
+  const group = game.divisionGroups?.get(player.id);
+  return (group && game.divisionChannels?.get(group)) || game.channel;
+}
+
+function sharesDiscussionRoom(
+  game: GameState,
+  left: Player,
+  right: Player,
+): boolean {
+  const leftGroup = game.divisionGroups?.get(left.id);
+  return !leftGroup || game.divisionGroups?.get(right.id) === leftGroup;
+}
+
+async function sendDiscussionMessage(
+  game: GameState,
+  speaker: Player,
+  content: string,
+): Promise<Message> {
+  return divisionChannelForPlayer(game, speaker).send(content);
+}
+
+async function restoreDivisionChannels(
+  game: GameState,
+  reason: string,
+): Promise<void> {
+  const channels = [...(game.divisionChannels?.values() ?? [])];
+  const originalPermissions = game.divisionOriginalViewPermissions;
+
+  if (originalPermissions) {
+    for (const [overwriteId, permission] of originalPermissions) {
+      await game.channel.permissionOverwrites.edit(overwriteId, {
+        ViewChannel: viewPermissionValue(permission),
+      });
+    }
+  }
+
+  game.divisionChannels = undefined;
+  game.divisionPhaseMessages = undefined;
+  game.divisionOriginalViewPermissions = undefined;
+  game.divisionGroups = new Map();
+
+  await Promise.all(
+    channels.map((channel) =>
+      channel.delete(reason).catch((error) => {
+        console.error(`Division channel delete failed (${channel.id}):`, error);
+      }),
+    ),
+  );
+}
+
+function hasDivisionChannelPermission(game: GameState): boolean {
+  const botMember = game.channel.guild.members.me;
+  return Boolean(
+    botMember &&
+    game.channel
+      .permissionsFor(botMember)
+      .has(PermissionFlagsBits.ManageChannels),
+  );
+}
+
+async function activateDivisionChannels(game: GameState): Promise<boolean> {
+  const groups = game.divisionGroups;
+  if (!groups || groups.size === 0) return true;
+  const botMember = game.channel.guild.members.me;
+  if (!botMember || !hasDivisionChannelPermission(game)) {
+    game.divisionGroups = new Map();
+    await game.channel
+      .send(
+        "⚠️ 分断者の能力を使うには、Botロールの「チャンネル管理」権限が必要です。今回は分断せずに進行します。",
+      )
+      .catch(() => undefined);
+    return false;
+  }
+
+  const everyoneId = game.channel.guild.roles.everyone.id;
+  const humanIds = aliveHumans(game).map((player) => player.id);
+  const overwriteIds = [everyoneId, ...humanIds];
+  game.divisionOriginalViewPermissions = new Map(
+    overwriteIds.map((id) => [id, explicitViewPermission(game.channel, id)]),
+  );
+  game.divisionChannels = new Map();
+
+  try {
+    for (const group of ["A", "B"] as const) {
+      const memberIds = alivePlayers(game)
+        .filter(
+          (player) =>
+            !player.isNpc && game.divisionGroups?.get(player.id) === group,
+        )
+        .map((player) => player.id);
+      const channel = await game.channel.guild.channels.create({
+        name: `人狼-${group.toLowerCase()}-${game.day}日目`,
+        type: ChannelType.GuildText,
+        parent: game.channel.parentId,
+        topic: divisionRecoveryTopic(
+          game.channelId,
+          game.divisionOriginalViewPermissions,
+        ),
+        permissionOverwrites: [
+          {
+            id: everyoneId,
+            deny: [PermissionFlagsBits.ViewChannel],
+          },
+          {
+            id: botMember.id,
+            allow: [
+              PermissionFlagsBits.ViewChannel,
+              PermissionFlagsBits.SendMessages,
+              PermissionFlagsBits.ReadMessageHistory,
+            ],
+          },
+          ...memberIds.map((id) => ({
+            id,
+            allow: [
+              PermissionFlagsBits.ViewChannel,
+              PermissionFlagsBits.SendMessages,
+              PermissionFlagsBits.ReadMessageHistory,
+            ],
+          })),
+        ],
+        reason: `人狼ゲーム ${game.day}日目：分断者の能力`,
+      });
+      game.divisionChannels.set(group, channel);
+    }
+
+    for (const overwriteId of overwriteIds) {
+      await game.channel.permissionOverwrites.edit(overwriteId, {
+        ViewChannel: false,
+      });
+    }
+    return true;
+  } catch (error) {
+    console.error("Division channel setup failed:", error);
+    try {
+      await restoreDivisionChannels(game, "分断チャンネルの作成失敗");
+    } catch (restoreError) {
+      console.error("Division permission restore failed:", restoreError);
+    }
+    await game.channel
+      .send(
+        "⚠️ 分断用チャンネルを作成できなかったため、今回は分断せずに進行します。Botの「チャンネル管理」権限を確認してください。",
+      )
+      .catch(() => undefined);
+    return false;
+  }
+}
+
+export async function recoverOrphanedDivisionChannels(
+  guilds: Iterable<Guild>,
+): Promise<number> {
+  let recovered = 0;
+  for (const guild of guilds) {
+    await guild.channels.fetch().catch((error) => {
+      console.error(
+        `Division recovery channel fetch failed (${guild.id}):`,
+        error,
+      );
+    });
+    const sectors = [...guild.channels.cache.values()].flatMap((channel) => {
+      if (channel.type !== ChannelType.GuildText) return [];
+      const snapshot = divisionRecoverySnapshotFromTopic(channel.topic);
+      return snapshot ? [{ channel, snapshot }] : [];
+    });
+    const byMainChannel = new Map<string, typeof sectors>();
+    for (const sector of sectors) {
+      const entries = byMainChannel.get(sector.snapshot.mainChannelId) ?? [];
+      entries.push(sector);
+      byMainChannel.set(sector.snapshot.mainChannelId, entries);
+    }
+
+    for (const [mainChannelId, entries] of byMainChannel) {
+      const mainChannel = guild.channels.cache.get(mainChannelId);
+      try {
+        if (mainChannel?.type === ChannelType.GuildText) {
+          for (const [overwriteId, permission] of entries[0].snapshot
+            .permissions) {
+            await mainChannel.permissionOverwrites.edit(overwriteId, {
+              ViewChannel: viewPermissionValue(permission),
+            });
+          }
+        }
+        await Promise.all(
+          entries.map(({ channel }) =>
+            channel.delete("Bot再起動による分断状態の復旧"),
+          ),
+        );
+        recovered += 1;
+      } catch (error) {
+        console.error(
+          `Orphaned division recovery failed (${guild.id}/${mainChannelId}):`,
+          error,
+        );
+      }
+    }
+  }
+  return recovered;
+}
+
 async function terminateAfterPhasePanelFailure(game: GameState): Promise<void> {
   if (!isActiveGame(game)) return;
   if (!game.analyticsCompleted) {
@@ -417,6 +692,10 @@ async function terminateAfterPhasePanelFailure(game: GameState): Promise<void> {
   game.resolving = true;
   game.resolutionQueued = false;
   game.starting = false;
+  await restoreDivisionChannels(game, "ゲーム進行エラーによる分断解除").catch(
+    (error) =>
+      console.error("Division cleanup after panel failure failed:", error),
+  );
   games.delete(game.channelId);
   await disableFeedbackPanel(game);
 }
@@ -452,6 +731,63 @@ async function openPhasePanel(
     return false;
   }
   game.phaseMessage = message;
+  return true;
+}
+
+async function openDiscussionPanels(
+  game: GameState,
+  components: PhaseRow[],
+): Promise<boolean> {
+  const channels = game.divisionChannels;
+  if (!channels || channels.size === 0) {
+    return openPhasePanel(game, {
+      content: "",
+      embeds: [dayEmbed(game)],
+      components,
+    });
+  }
+
+  const messages: Message[] = [];
+  try {
+    for (const group of ["A", "B"] as const) {
+      const channel = channels.get(group);
+      if (!channel) throw new Error(`Division channel ${group} is missing.`);
+      messages.push(
+        await channel.send({
+          content: "",
+          embeds: [dayEmbed(game, group)],
+          components,
+        }),
+      );
+    }
+  } catch (error) {
+    console.error(`Division panel send failed (day ${game.day}):`, error);
+    await Promise.all(
+      messages.map((message) =>
+        message.edit({ components: [] }).catch(() => undefined),
+      ),
+    );
+    await restoreDivisionChannels(game, "分断議論の開始失敗").catch(
+      (restoreError) =>
+        console.error(
+          "Division cleanup after panel failure failed:",
+          restoreError,
+        ),
+    );
+    await terminateAfterPhasePanelFailure(game);
+    return false;
+  }
+
+  if (!isActiveGame(game)) {
+    await Promise.all(
+      messages.map((message) =>
+        message.edit({ components: [] }).catch(() => undefined),
+      ),
+    );
+    return false;
+  }
+  game.divisionPhaseMessages = messages;
+  game.phaseMessage = messages[0];
   return true;
 }
 
@@ -530,7 +866,8 @@ function effectivePlayerTeam(
   player: Player,
   visited = new Set<string>(),
 ): string {
-  if (loverPairs(game).some((pair) => pair.includes(player.id))) return "lovers";
+  if (loverPairs(game).some((pair) => pair.includes(player.id)))
+    return "lovers";
   if (player.role === "妖狐") return "fox";
   if (player.role === "てるてる") return "teruteru";
   if (player.role === "純愛者" && !visited.has(player.id)) {
@@ -870,22 +1207,38 @@ function resultClaimFieldName(
   return `${icon} ${role}CO｜${claimantCount}/${capacity}人${stateLabel}`;
 }
 
-export function claimListEmbed(game: GameState): EmbedBuilder {
+export function claimListEmbed(
+  game: GameState,
+  visibleSpeakerIds?: ReadonlySet<string>,
+): EmbedBuilder {
+  const visibleGame: GameState = visibleSpeakerIds
+    ? {
+        ...game,
+        npcClaims: game.npcClaims.filter((claim) =>
+          visibleSpeakerIds.has(claim.speakerId),
+        ),
+        roleDeclarations: new Set(
+          [...game.roleDeclarations].filter((declaration) =>
+            visibleSpeakerIds.has(declaration.split(":")[1]),
+          ),
+        ),
+      }
+    : game;
   return new EmbedBuilder()
     .setTitle(`CO・判定一覧｜${game.day}日目`)
     .setDescription(
-      "公開中のCOを配役人数と比較しています。枠内のCOも本物とは限りません。取り消されたCOは表示されません。",
+      `${visibleSpeakerIds ? "現在の分断部屋で" : ""}公開中のCOを配役人数と比較しています。枠内のCOも本物とは限りません。取り消されたCOは表示されません。`,
     )
     .addFields(
       ...chunkedClaimFields(
-        resultClaimFieldName(game, "占い師"),
-        resultClaimRows(game, "占い師"),
+        resultClaimFieldName(visibleGame, "占い師"),
+        resultClaimRows(visibleGame, "占い師"),
       ),
       ...chunkedClaimFields(
-        resultClaimFieldName(game, "霊能者"),
-        resultClaimRows(game, "霊能者"),
+        resultClaimFieldName(visibleGame, "霊能者"),
+        resultClaimRows(visibleGame, "霊能者"),
       ),
-      ...chunkedClaimFields("🛡️ 騎士CO", guardClaimRows(game)),
+      ...chunkedClaimFields("🛡️ 騎士CO", guardClaimRows(visibleGame)),
     )
     .setColor(COLORS.day)
     .setFooter({ text: "● 人狼判定　○ 人間判定（各欄は直近30件）" });
@@ -935,8 +1288,16 @@ function mentionRows(players: Player[]): string {
   return players.map((player) => `<@${player.id}>`).join("\n") || "—";
 }
 
-export function dayEmbed(game: GameState): EmbedBuilder {
+export function dayEmbed(
+  game: GameState,
+  visibleGroup?: "A" | "B",
+): EmbedBuilder {
   const living = alivePlayers(game);
+  const visibleLiving = visibleGroup
+    ? living.filter(
+        (player) => game.divisionGroups?.get(player.id) === visibleGroup,
+      )
+    : living;
   const bakerExists = game.roleConfig.パン屋 > 0;
   const bakerAlive = living.some((player) => player.role === "パン屋");
   const breadLine = bakerExists
@@ -958,11 +1319,13 @@ export function dayEmbed(game: GameState): EmbedBuilder {
       `話し合って、投票先を決めよう。\n\n投票開始：${relativeTime(game.phaseEndsAt)}${openingDeathLine}${breadLine}`,
     )
     .addFields({
-      name: `生存者（${living.length}人）`,
-      value: playerNameRows(living),
+      name: visibleGroup
+        ? `${visibleGroup}組（${visibleLiving.length}人）`
+        : `生存者（${living.length}人）`,
+      value: playerNameRows(visibleLiving),
     })
     .setColor(COLORS.day);
-  if (game.divisionGroups && game.divisionGroups.size > 0) {
+  if (!visibleGroup && game.divisionGroups && game.divisionGroups.size > 0) {
     for (const group of ["A", "B"] as const) {
       const members = living.filter(
         (player) => game.divisionGroups?.get(player.id) === group,
@@ -1223,10 +1586,10 @@ export async function createLobby(
     return;
   }
 
-  const existing = games.get(interaction.channelId);
+  const existing = gameForChannelId(interaction.channelId);
   if (existing?.phase === "ended") {
     clearGameTimers(existing);
-    games.delete(interaction.channelId);
+    games.delete(existing.channelId);
     void existing.phaseMessage?.edit({ components: [] }).catch(() => undefined);
     void disableFeedbackPanel(existing);
   } else if (existing) {
@@ -1237,7 +1600,10 @@ export async function createLobby(
     return;
   }
 
-  const participantUsers = [interaction.user, ...(options.participants ?? [])].filter(
+  const participantUsers = [
+    interaction.user,
+    ...(options.participants ?? []),
+  ].filter(
     (user, index, users) =>
       !user.bot &&
       users.findIndex((candidate) => candidate.id === user.id) === index,
@@ -1320,7 +1686,9 @@ export async function createLobby(
   try {
     let lobbyMessage: Message;
     if (responseStarted) {
-      lobbyMessage = (await interaction.followUp(lobbyPayload(game))) as Message;
+      lobbyMessage = (await interaction.followUp(
+        lobbyPayload(game),
+      )) as Message;
       if (interaction.deferred) {
         await interaction
           .editReply({
@@ -1432,7 +1800,7 @@ export async function resetChannel(
   editMessage = true,
   requester?: ResetChannelRequester,
 ): Promise<ResetChannelResult> {
-  const game = games.get(channelId);
+  const game = gameForChannelId(channelId);
   if (!game) return { status: "not_found", components: [] };
   if (requester && !canResetGame(game, requester)) {
     return { status: "forbidden", components: [] };
@@ -1441,6 +1809,9 @@ export async function resetChannel(
     game.analyticsStartedAt && game.phase !== "ended",
   );
   clearGameTimers(game);
+  await restoreDivisionChannels(game, "ゲーム終了による分断解除").catch(
+    (error) => console.error("Division cleanup during reset failed:", error),
+  );
   let abandonReasonComponents: Array<ActionRowBuilder<ButtonBuilder>> = [];
   if (game.phase !== "ended" && !game.analyticsCompleted) {
     const durationSeconds = playedSeconds(game);
@@ -1474,7 +1845,7 @@ export async function resetChannel(
   game.resolving = true;
   game.resolutionQueued = false;
   game.starting = false;
-  games.delete(channelId);
+  games.delete(game.channelId);
   await disableFeedbackPanel(game);
   if (editMessage) {
     if (!wasInProgress) {
@@ -1740,7 +2111,9 @@ function configurableRoleToken(role: ConfigurableRole): string {
   return CONFIGURABLE_ROLE_NAMES.indexOf(role).toString(36);
 }
 
-function roleFromConfigurableToken(token: string): ConfigurableRole | undefined {
+function roleFromConfigurableToken(
+  token: string,
+): ConfigurableRole | undefined {
   const index = Number.parseInt(token, 36);
   return CONFIGURABLE_ROLE_NAMES[index] as ConfigurableRole | undefined;
 }
@@ -1794,53 +2167,54 @@ export function roleConfigPanel(
     .setColor(COLORS.lobby)
     .setFooter({ text: "村人は残り人数から自動計算されます" });
 
-  const selector = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId(componentId("role-config-select", game))
-      .setPlaceholder("変更する役職を選ぶ")
-      .addOptions(
-        CONFIGURABLE_ROLE_NAMES.map((role) => ({
-          label: `${ROLE_INFO[role].icon} ${role}`,
-          description: `${ROLE_INFO[role].description.slice(0, 82)} (${game.roleConfig[role]}人)`,
-          value: configurableRoleToken(role as ConfigurableRole),
-          default: role === selectedRole,
-        })),
-      ),
-  );
+  const selector =
+    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(componentId("role-config-select", game))
+        .setPlaceholder("変更する役職を選ぶ")
+        .addOptions(
+          CONFIGURABLE_ROLE_NAMES.map((role) => ({
+            label: `${ROLE_INFO[role].icon} ${role}`,
+            description: `${ROLE_INFO[role].description.slice(0, 82)} (${game.roleConfig[role]}人)`,
+            value: configurableRoleToken(role as ConfigurableRole),
+            default: role === selectedRole,
+          })),
+        ),
+    );
   const current = game.roleConfig[selectedRole];
   const step = roleCountStep(selectedRole);
   const adjust = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId(
-          componentId(
-            `role-decrease-${configurableRoleToken(selectedRole)}`,
-            game,
-          ),
-        )
-        .setLabel("−")
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(!canUseRoleCount(game, selectedRole, current - step)),
-      new ButtonBuilder()
-        .setCustomId(
-          componentId(
-            `role-current-${configurableRoleToken(selectedRole)}`,
-            game,
-          ),
-        )
-        .setLabel(`${ROLE_INFO[selectedRole].icon} ${selectedRole} ${current}人`)
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(true),
-      new ButtonBuilder()
-        .setCustomId(
-          componentId(
-            `role-increase-${configurableRoleToken(selectedRole)}`,
-            game,
-          ),
-        )
-        .setLabel("＋")
-        .setStyle(ButtonStyle.Primary)
-        .setDisabled(!canUseRoleCount(game, selectedRole, current + step)),
-    );
+    new ButtonBuilder()
+      .setCustomId(
+        componentId(
+          `role-decrease-${configurableRoleToken(selectedRole)}`,
+          game,
+        ),
+      )
+      .setLabel("−")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!canUseRoleCount(game, selectedRole, current - step)),
+    new ButtonBuilder()
+      .setCustomId(
+        componentId(
+          `role-current-${configurableRoleToken(selectedRole)}`,
+          game,
+        ),
+      )
+      .setLabel(`${ROLE_INFO[selectedRole].icon} ${selectedRole} ${current}人`)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(true),
+    new ButtonBuilder()
+      .setCustomId(
+        componentId(
+          `role-increase-${configurableRoleToken(selectedRole)}`,
+          game,
+        ),
+      )
+      .setLabel("＋")
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(!canUseRoleCount(game, selectedRole, current + step)),
+  );
   return { content: "", embeds: [embed], components: [selector, adjust] };
 }
 
@@ -1861,7 +2235,10 @@ async function handleRoleConfigSelect(
   }
   const role = roleFromConfigurableToken(interaction.values[0]);
   if (!role) {
-    await interaction.reply({ content: "役職を選び直してください。", ephemeral: true });
+    await interaction.reply({
+      content: "役職を選び直してください。",
+      ephemeral: true,
+    });
     return;
   }
   await interaction.update(roleConfigPanel(game, role));
@@ -1964,6 +2341,14 @@ async function handleStart(
     });
     return;
   }
+  if (game.roleConfig.分断者 > 0 && !hasDivisionChannelPermission(game)) {
+    await interaction.reply({
+      content:
+        "分断者を使うには、Botロールへ「チャンネル管理」権限を付けてください。「サーバー管理」権限は不要です。",
+      ephemeral: true,
+    });
+    return;
+  }
   if (game.roleDmFailures.size === 0) {
     game.players = game.players.filter((player) => !player.isNpc);
     while (game.players.length < game.targetPlayerCount) addNpc(game);
@@ -2055,7 +2440,7 @@ export function roleDmEmbed(game: GameState, player: Player): EmbedBuilder {
               (other) => other.role === "共有者" && other.id !== player.id,
             )
             .map((other) => safeName(other))
-      : [];
+        : [];
   const allyLabel = role === "共有者" ? "共有者の相方" : "人狼";
   const allyText = allies.length ? `\n${allyLabel}: ${allies.join("、")}` : "";
   const firstResult = game.seerResults.get(player.id)?.[0];
@@ -2104,19 +2489,24 @@ export function gameStartEmbed(game: GameState): EmbedBuilder {
     .setFooter({ text: "まもなく最初の議論が始まります" });
 }
 
-export function interruptedGameEmbed(game: Pick<GameState, "day">): EmbedBuilder {
+export function interruptedGameEmbed(
+  game: Pick<GameState, "day">,
+): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle("ゲーム終了｜中断")
     .setDescription("主催者または管理者が進行中のゲームを終了しました。")
     .setColor(COLORS.danger)
-    .setFooter({ text: game.day > 0 ? `${game.day}日目で中断` : "開始前に中断" });
+    .setFooter({
+      text: game.day > 0 ? `${game.day}日目で中断` : "開始前に中断",
+    });
 }
 
 async function startGame(game: GameState): Promise<void> {
   if (games.get(game.channelId) !== game) return;
   const hasPreparedRoles = game.players.every((player) => player.role);
   const preparedRolesNow = !hasPreparedRoles;
-  const canDiscardPreparedRoles = preparedRolesNow || game.roleDmSent.size === 0;
+  const canDiscardPreparedRoles =
+    preparedRolesNow || game.roleDmSent.size === 0;
   if (!hasPreparedRoles) {
     const assignments = assignGameRoles(
       game.players,
@@ -2148,6 +2538,9 @@ async function startGame(game: GameState): Promise<void> {
     game.fatalWoundIds = new Set();
     game.pendingDivision = undefined;
     game.divisionGroups = new Map();
+    game.divisionChannels = undefined;
+    game.divisionPhaseMessages = undefined;
+    game.divisionOriginalViewPermissions = undefined;
     game.loquaciousMissions = new Map();
     game.loquaciousCompleted = new Set();
     game.pendingDmMessages.clear();
@@ -2506,13 +2899,13 @@ async function handleClaimListButton(
   game: GameState,
   day: number,
 ): Promise<void> {
-  const isParticipant = game.players.some(
+  const participant = game.players.find(
     (player) => player.id === interaction.user.id && !player.isNpc,
   );
   if (
     (game.phase !== "day" && game.phase !== "voting") ||
     day !== game.day ||
-    !isParticipant
+    !participant
   ) {
     await interaction.reply({
       content: "現在はCO・判定一覧を確認できません。",
@@ -2520,8 +2913,16 @@ async function handleClaimListButton(
     });
     return;
   }
+  const group = game.divisionGroups?.get(participant.id);
+  const visibleSpeakerIds = group
+    ? new Set(
+        game.players
+          .filter((player) => game.divisionGroups?.get(player.id) === group)
+          .map((player) => player.id),
+      )
+    : undefined;
   await interaction.reply({
-    embeds: [claimListEmbed(game)],
+    embeds: [claimListEmbed(game, visibleSpeakerIds)],
     ephemeral: true,
   });
 }
@@ -2649,7 +3050,7 @@ async function handleQuickResultClaim(
         : `実際の${claimedRole === "占い師" ? "占い" : "霊能"}結果をそのまま公開しました。`,
     components: [],
   });
-  await game.channel.send(publishedLines.join("\n"));
+  await sendDiscussionMessage(game, claimant, publishedLines.join("\n"));
 }
 
 async function handleQuickGuardClaim(
@@ -2676,7 +3077,11 @@ async function handleQuickGuardClaim(
     content: "騎士COを公開しました。",
     components: [],
   });
-  await game.channel.send(roleDeclarationLine(claimant, "騎士"));
+  await sendDiscussionMessage(
+    game,
+    claimant,
+    roleDeclarationLine(claimant, "騎士"),
+  );
 }
 
 async function handleCustomClaimOpen(
@@ -2766,7 +3171,7 @@ async function handleClaimRetractionPrompt(
     return;
   }
   await interaction.update({
-    content: `**${claimedRole}COを取り消しますか？**\n公開済みの判定もすべて無効になります。取り消したことは全員に通知されます。`,
+    content: `**${claimedRole}COを取り消しますか？**\n公開済みの判定もすべて無効になります。取り消したことは${game.divisionGroups?.has(claimant.id) ? "同じ分断部屋" : "全員"}に通知されます。`,
     components: [claimRetractionConfirmRow(game)],
   });
 }
@@ -2796,7 +3201,11 @@ async function handleClaimRetractionConfirm(
     content: `${claimedRole}COを取り消しました。もう一度COし直せます。`,
     components: [],
   });
-  await game.channel.send(roleRetractionLine(claimant, claimedRole));
+  await sendDiscussionMessage(
+    game,
+    claimant,
+    roleRetractionLine(claimant, claimedRole),
+  );
 }
 
 async function handleClaimRetractionCancel(
@@ -2842,7 +3251,11 @@ async function handleClaimRole(
     }
     recordGuardDeclaration(game, claimant);
     await interaction.update({ content: "COを公開しました。", components: [] });
-    await game.channel.send(roleDeclarationLine(claimant, "騎士"));
+    await sendDiscussionMessage(
+      game,
+      claimant,
+      roleDeclarationLine(claimant, "騎士"),
+    );
     return;
   }
   const claimedRole = requestedRole;
@@ -2980,29 +3393,43 @@ async function handleClaimResult(
         : "COを公開しました。",
     components: [],
   });
-  await game.channel.send(
+  await sendDiscussionMessage(
+    game,
+    claimant,
     roleClaimLine(claimant, claimedRole, target, result, resultDay),
   );
+}
+
+export function divisionGroupsForPlayers(
+  living: Player[],
+  dividerId: string,
+  targetId: string,
+): Map<string, "A" | "B"> {
+  const togetherIds = new Set([dividerId, targetId]);
+  const roomA = living.filter((player) => togetherIds.has(player.id));
+  const remaining = living.filter((player) => !togetherIds.has(player.id));
+  const roomATargetSize = Math.ceil(living.length / 2);
+  while (roomA.length < roomATargetSize && remaining.length > 0) {
+    const next = remaining.shift();
+    if (next) roomA.push(next);
+  }
+  return new Map([
+    ...roomA.map((player) => [player.id, "A"] as const),
+    ...remaining.map((player) => [player.id, "B"] as const),
+  ]);
 }
 
 async function prepareDayRoleEffects(game: GameState): Promise<void> {
   game.divisionGroups = new Map();
   if (game.pendingDivision?.day === game.day) {
     const living = shuffle(alivePlayers(game));
-    living.forEach((player, index) =>
-      game.divisionGroups?.set(player.id, index % 2 === 0 ? "A" : "B"),
+    game.divisionGroups = divisionGroupsForPlayers(
+      living,
+      game.pendingDivision.dividerId,
+      game.pendingDivision.targetId,
     );
-    const targetGroup = game.divisionGroups.get(game.pendingDivision.targetId);
-    if (targetGroup === "A" && living.length > 1) {
-      const swap = living.find(
-        (player) => game.divisionGroups?.get(player.id) === "B",
-      );
-      if (swap) {
-        game.divisionGroups.set(game.pendingDivision.targetId, "B");
-        game.divisionGroups.set(swap.id, "A");
-      }
-    }
     game.pendingDivision = undefined;
+    await activateDivisionChannels(game);
   }
 
   game.loquaciousMissions = new Map();
@@ -3027,17 +3454,9 @@ async function prepareDayRoleEffects(game: GameState): Promise<void> {
               new EmbedBuilder()
                 .setTitle("🗣️ 饒舌ミッション")
                 .setDescription(
-                  `今日のお題は **「${word}」** です。下のボタンを押すと、お題を含む発言を公開できます。夜までに達成できないと死亡します。`,
+                  `今日のお題は **「${word}」** です。議論中に、お題を含むメッセージを自分で送信してください。夜までに達成できないと死亡します。`,
                 )
                 .setColor(COLORS.danger),
-            ],
-            components: [
-              new ActionRowBuilder<ButtonBuilder>().addComponents(
-                new ButtonBuilder()
-                  .setCustomId(componentId("loquacious-complete", game))
-                  .setLabel("お題を発言する")
-                  .setStyle(ButtonStyle.Primary),
-              ),
             ],
           })
           .then(
@@ -3113,12 +3532,7 @@ async function startDay(game: GameState): Promise<void> {
       ),
     );
   }
-  const payload = {
-    content: "",
-    embeds: [dayEmbed(game)],
-    components: dayComponents,
-  };
-  if (!(await openPhasePanel(game, payload))) return;
+  if (!(await openDiscussionPanels(game, dayComponents))) return;
 
   scheduleNpcDiscussion(game, daySeconds);
   schedule(game, daySeconds * 1000, () => startVoting(game));
@@ -3132,8 +3546,11 @@ function scheduleNpcDiscussion(game: GameState, daySeconds: number): void {
     const delayMs = Math.min(4000 + index * 7000, availableMs);
     schedule(game, delayMs, async () => {
       if (game.phase !== "day" || !npc.alive) return;
+      const npcGroup = game.divisionGroups?.get(npc.id);
       const targets = alivePlayers(game).filter(
-        (player) => player.id !== npc.id,
+        (player) =>
+          player.id !== npc.id &&
+          (!npcGroup || game.divisionGroups?.get(player.id) === npcGroup),
       );
       if (!targets.length) return;
 
@@ -3142,30 +3559,16 @@ function scheduleNpcDiscussion(game: GameState, daySeconds: number): void {
       if (knownResults.length > 0) {
         const publishedLines: string[] = [];
         for (const { day: resultDay, target, result } of knownResults) {
-          if (
-            !recordRoleClaim(
-              game,
-              npc,
-              "占い師",
-              target,
-              result,
-              resultDay,
-            )
-          )
+          if (!recordRoleClaim(game, npc, "占い師", target, result, resultDay))
             continue;
-          rememberSuspect(
-            game,
-            npc.id,
-            target.id,
-            result === "人狼" ? 6 : -3,
-          );
+          rememberSuspect(game, npc.id, target.id, result === "人狼" ? 6 : -3);
           applyPublicClaimSuspicion(game, target, result);
           publishedLines.push(
             roleClaimLine(npc, "占い師", target, result, resultDay),
           );
         }
         if (publishedLines.length > 0)
-          await game.channel.send(publishedLines.join("\n"));
+          await sendDiscussionMessage(game, npc, publishedLines.join("\n"));
         return;
       }
 
@@ -3183,7 +3586,9 @@ function scheduleNpcDiscussion(game: GameState, daySeconds: number): void {
           )
         )
           return;
-        await game.channel.send(
+        await sendDiscussionMessage(
+          game,
+          npc,
           roleClaimLine(
             npc,
             "霊能者",
@@ -3260,7 +3665,7 @@ function scheduleNpcDiscussion(game: GameState, daySeconds: number): void {
           );
         }
         if (publishedLines.length > 0)
-          await game.channel.send(publishedLines.join("\n"));
+          await sendDiscussionMessage(game, npc, publishedLines.join("\n"));
         return;
       }
 
@@ -3282,7 +3687,11 @@ function scheduleNpcDiscussion(game: GameState, daySeconds: number): void {
             safeName(suspect),
             insight.reason,
           );
-          await game.channel.send(`**${safeName(npc)}**（NPC）　${line}`);
+          await sendDiscussionMessage(
+            game,
+            npc,
+            `**${safeName(npc)}**（NPC）　${line}`,
+          );
           return;
         }
       }
@@ -3297,7 +3706,11 @@ function scheduleNpcDiscussion(game: GameState, daySeconds: number): void {
         safeName(target),
         previousVoteReason(game, target.id),
       );
-      await game.channel.send(`**${safeName(npc)}**（NPC）　${line}`);
+      await sendDiscussionMessage(
+        game,
+        npc,
+        `**${safeName(npc)}**（NPC）　${line}`,
+      );
     });
   });
 }
@@ -3363,10 +3776,37 @@ function scheduleNpcVotes(game: GameState): void {
 
 async function startVoting(game: GameState): Promise<void> {
   if (!isActiveGame(game) || game.phase !== "day") return;
-  await game.phaseMessage
-    ?.edit({ embeds: [finishedDayEmbed(game)], components: [] })
-    .catch(() => undefined);
+  const dayMessages = game.divisionPhaseMessages?.length
+    ? game.divisionPhaseMessages
+    : game.phaseMessage
+      ? [game.phaseMessage]
+      : [];
+  await Promise.all(
+    dayMessages.map((message) =>
+      message
+        .edit({ embeds: [finishedDayEmbed(game)], components: [] })
+        .catch(() => undefined),
+    ),
+  );
+  if (game.divisionChannels?.size) {
+    try {
+      await restoreDivisionChannels(game, "投票開始による分断解除");
+    } catch (error) {
+      console.error("Division permission restore before voting failed:", error);
+      await Promise.all(
+        [...game.divisionChannels.values()].map((channel) =>
+          channel
+            .send(
+              "⚠️ 元のチャンネルへ戻せませんでした。Botに「チャンネル管理」権限を戻してから `/reset` を実行してください。",
+            )
+            .catch(() => undefined),
+        ),
+      );
+      return;
+    }
+  }
   if (!isActiveGame(game)) return;
+  game.phaseMessage = undefined;
   game.phase = "voting";
   game.voteRound = 1;
   game.voteCandidateIds = alivePlayers(game).map((player) => player.id);
@@ -3413,38 +3853,46 @@ function randomItem<T>(items: T[]): T {
   return items[Math.floor(Math.random() * items.length)];
 }
 
-async function handleLoquaciousComplete(
-  interaction: ButtonInteraction,
+export function completeLoquaciousMissionForMessage(
   game: GameState,
-  day: number,
-): Promise<void> {
-  const player = activeHumanPlayer(game, interaction.user.id);
+  authorId: string,
+  channelId: string,
+  content: string,
+): string | undefined {
+  const player = activeHumanPlayer(game, authorId);
   const word = player ? loquaciousMissions(game).get(player.id) : undefined;
   if (
     game.phase !== "day" ||
-    game.day !== day ||
     player?.role !== "饒舌な人狼" ||
-    !word
-  ) {
-    await interaction.reply({
-      content: "この饒舌ミッションは現在使用できません。",
-      ephemeral: true,
-    });
-    return;
-  }
-  if (loquaciousCompleted(game).has(player.id)) {
-    await interaction.reply({ content: "今日のお題は達成済みです。", ephemeral: true });
-    return;
-  }
+    !word ||
+    loquaciousCompleted(game).has(player.id)
+  )
+    return undefined;
+  const group = game.divisionGroups?.get(player.id);
+  const expectedChannelId = group
+    ? game.divisionChannels?.get(group)?.id
+    : game.channelId;
+  if (channelId !== expectedChannelId || !content.includes(word))
+    return undefined;
   loquaciousCompleted(game).add(player.id);
-  await interaction.update({
-    content: `✅ お題「${word}」を発言しました。`,
-    embeds: [],
-    components: [],
-  });
-  await game.channel.send(
-    `**${safeName(player)}**（プレイヤー）　今日は **${word}** を軸に考えたい。`,
+  return word;
+}
+
+export async function handleGuildMessage(message: Message): Promise<void> {
+  if (!message.inGuild() || message.author.bot) return;
+  const game = gameForChannelId(message.channelId);
+  if (game?.channel.guildId !== message.guildId) return;
+  if (!game || !isActiveGame(game)) return;
+  const word = completeLoquaciousMissionForMessage(
+    game,
+    message.author.id,
+    message.channelId,
+    message.content,
   );
+  if (!word) return;
+  await message.author
+    .send(`✅ お題「${word}」を確認しました。突然死を回避しました。`)
+    .catch(() => undefined);
 }
 
 export function eliminateWithLovers(
@@ -3732,7 +4180,7 @@ async function handleNpcQuestionOpen(
     .setPlaceholder("話を聞きたいNPCを選ぶ")
     .addOptions(playerOptions(npcs));
   await interaction.reply({
-    content: `回答は全員に公開されます。今日はあと${remaining}回質問できます。`,
+    content: `回答は${game.divisionGroups?.has(actor.id) ? "同じ分断部屋" : "全員"}に公開されます。今日はあと${remaining}回質問できます。`,
     components: [
       new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu),
     ],
@@ -3753,6 +4201,13 @@ async function handleNpcQuestion(
   if (game.phase !== "day" || game.day !== day || !actor || !npc) {
     await interaction.reply({
       content: "現在はNPCに質問できません。",
+      ephemeral: true,
+    });
+    return;
+  }
+  if (!sharesDiscussionRoom(game, actor, npc)) {
+    await interaction.reply({
+      content: "別の分断部屋にいるNPCには質問できません。",
       ephemeral: true,
     });
     return;
@@ -3790,7 +4245,11 @@ async function handleNpcQuestion(
         : "回答を公開しました。今日の質問はこれで終了です。",
     ephemeral: true,
   });
-  await game.channel.send(npcQuestionLine(actor, npc, target, answer.reason));
+  await sendDiscussionMessage(
+    game,
+    actor,
+    npcQuestionLine(actor, npc, target, answer.reason),
+  );
 }
 
 async function handleSuspect(
@@ -3809,7 +4268,8 @@ async function handleSuspect(
     game.day !== day ||
     !actor?.alive ||
     actor.isNpc ||
-    !target
+    !target ||
+    !sharesDiscussionRoom(game, actor, target)
   ) {
     await interaction.reply({
       content: "現在は意見を表明できません。",
@@ -3863,7 +4323,8 @@ async function handleSuspectReason(
     !actor ||
     !target ||
     actor.id === target.id ||
-    !reason
+    !reason ||
+    !sharesDiscussionRoom(game, actor, target)
   ) {
     await interaction.reply({
       content: "現在はその意見を表明できません。",
@@ -3889,10 +4350,14 @@ async function handleSuspectReason(
   const argument: HumanArgument = { targetId: target.id, reason };
   game.humanSuspicions.set(actor.id, argument);
   await interaction.update({
-    content: "意見を公開しました。全員とNPCに見えています。",
+    content: game.divisionGroups?.has(actor.id)
+      ? "意見を公開しました。同じ分断部屋の参加者とNPCに見えています。"
+      : "意見を公開しました。全員とNPCに見えています。",
     components: [],
   });
-  await game.channel.send(
+  await sendDiscussionMessage(
+    game,
+    actor,
     humanOpinionLine(
       actor,
       target,
@@ -4016,7 +4481,10 @@ async function revealVoteResult(game: GameState): Promise<void> {
   recordCurrentVoteRound(game);
 
   const living = alivePlayers(game);
-  const outcome = resolveVoteOutcome(weightedVoteTargetIds(game), game.voteRound);
+  const outcome = resolveVoteOutcome(
+    weightedVoteTargetIds(game),
+    game.voteRound,
+  );
 
   if (outcome.kind === "revote") {
     game.phaseEndsAt = Date.now() + holdSeconds * 1000;
@@ -4098,7 +4566,17 @@ async function revealVoteResult(game: GameState): Promise<void> {
         new EmbedBuilder()
           .setTitle(`${game.day}日目｜投票結果`)
           .setDescription(
-            `村の決定により、**${safeName(executed)}** が処刑されました。${deaths.length > 1 ? `\n${deaths.slice(1).map((player) => `**${safeName(player)}** が道連れになりました。`).join("\n")}` : ""}`,
+            `村の決定により、**${safeName(executed)}** が処刑されました。${
+              deaths.length > 1
+                ? `\n${deaths
+                    .slice(1)
+                    .map(
+                      (player) =>
+                        `**${safeName(player)}** が道連れになりました。`,
+                    )
+                    .join("\n")}`
+                : ""
+            }`,
           )
           .addFields(
             { name: "得票数", value: voteTallyRows(game) },
@@ -4211,7 +4689,9 @@ export function recordNightHistory(
       },
     ),
     attackTargetId,
-    victimId: deathIds.includes(attackTargetId ?? "") ? attackTargetId : undefined,
+    victimId: deathIds.includes(attackTargetId ?? "")
+      ? attackTargetId
+      : undefined,
     deathIds,
     guarded,
   };
@@ -4259,14 +4739,13 @@ export function nightActionForPlayer(
   if (isActualWolfRole(player.role)) return "kill";
   const role = player.role;
   if (!role) return undefined;
-  const action = (Object.entries(NIGHT_ACTION_ROLE) as Array<
-    [Exclude<NightAction, "kill">, RoleName]
-  >).find(([, requiredRole]) => requiredRole === role)?.[0];
+  const action = (
+    Object.entries(NIGHT_ACTION_ROLE) as Array<
+      [Exclude<NightAction, "kill">, RoleName]
+    >
+  ).find(([, requiredRole]) => requiredRole === role)?.[0];
   if (!action) return undefined;
-  if (
-    ["cupid", "devotee", "thief"].includes(action) &&
-    game.day !== 1
-  )
+  if (["cupid", "devotee", "thief"].includes(action) && game.day !== 1)
     return undefined;
   if (action === "compass" && game.day < 2) return undefined;
   if (
@@ -4342,19 +4821,25 @@ async function sendNightMenu(
     const message = await player.user.send({
       embeds: [
         new EmbedBuilder()
-          .setTitle(`🌙 夜の行動｜${({
-            kill: "襲撃",
-            seer: "占い",
-            guard: "護衛",
-            flee: "逃亡",
-            assassinate: "暗殺",
-            sorcery: "妖術",
-            divide: "分断",
-            compass: "方位磁針",
-            cupid: "恋人選択",
-            devotee: "想い人選択",
-            thief: "役職を盗む",
-          } satisfies Record<NightAction, string>)[action]}`)
+          .setTitle(
+            `🌙 夜の行動｜${
+              (
+                {
+                  kill: "襲撃",
+                  seer: "占い",
+                  guard: "護衛",
+                  flee: "逃亡",
+                  assassinate: "暗殺",
+                  sorcery: "妖術",
+                  divide: "分断",
+                  compass: "方位磁針",
+                  cupid: "恋人選択",
+                  devotee: "想い人選択",
+                  thief: "役職を盗む",
+                } satisfies Record<NightAction, string>
+              )[action]
+            }`,
+          )
           .setDescription(
             chatRow
               ? `${prompt}\n\n「人狼会議」から、生存中の人狼仲間だけに短文を送れます。`
@@ -4710,7 +5195,9 @@ export function fillMissingNightAction(
   const targets = nightTargets(game, player, action);
   if ((action === "cupid" || action === "compass") && targets.length >= 2) {
     const first = randomItem(targets);
-    const second = randomItem(targets.filter((target) => target.id !== first.id));
+    const second = randomItem(
+      targets.filter((target) => target.id !== first.id),
+    );
     game.nightChoices.set(key, `${first.id},${second.id}`);
     return;
   }
@@ -4820,8 +5307,7 @@ async function startNight(game: GameState): Promise<void> {
         prompt[action],
         nightTargets(game, player, action),
         {
-          targetCount:
-            action === "cupid" || action === "compass" ? 2 : 1,
+          targetCount: action === "cupid" || action === "compass" ? 2 : 1,
           allowSkip: action === "assassinate" || action === "divide",
         },
       );
@@ -4895,11 +5381,17 @@ async function handleNightAction(
 
   if (interaction.values[0] === "skip") {
     if (action !== "assassinate" && action !== "divide") {
-      await interaction.reply({ content: "この能力は見送れません。", ephemeral: true });
+      await interaction.reply({
+        content: "この能力は見送れません。",
+        ephemeral: true,
+      });
       return;
     }
     game.nightChoices.set(actionKey, "skip");
-    await interaction.update({ content: "今夜は能力を使いません。", components: [] });
+    await interaction.update({
+      content: "今夜は能力を使いません。",
+      components: [],
+    });
     if (expectedNightActions(game).every((key) => game.nightChoices.has(key)))
       queueNightResolutionAfterMinimum(game);
     return;
@@ -4944,7 +5436,9 @@ async function handleNightAction(
       components: [],
     });
   } else if (action === "compass") {
-    const sameTeam = effectivePlayerTeam(game, targets[0]) === effectivePlayerTeam(game, targets[1]);
+    const sameTeam =
+      effectivePlayerTeam(game, targets[0]) ===
+      effectivePlayerTeam(game, targets[1]);
     await interaction.update({
       content: `🧭 **${safeName(targets[0])}** と **${safeName(targets[1])}** は **${sameTeam ? "同じ陣営" : "別陣営"}** です。`,
       components: [],
@@ -5080,7 +5574,11 @@ async function resolveRelationshipAndUtilityActions(
   )) {
     const targetId = choice("divide", divider);
     if (!targetId || targetId === "skip") continue;
-    game.pendingDivision = { targetId, day: game.day + 1 };
+    game.pendingDivision = {
+      dividerId: divider.id,
+      targetId,
+      day: game.day + 1,
+    };
     usedRolePowers(game).add(powerUsedKey("divide", divider.id));
   }
 
@@ -5243,7 +5741,8 @@ async function revealNightResult(game: GameState): Promise<void> {
   }
 
   const uniqueDeaths = deaths.filter(
-    (player, index) => deaths.findIndex((item) => item.id === player.id) === index,
+    (player, index) =>
+      deaths.findIndex((item) => item.id === player.id) === index,
   );
   recordNightHistory(
     game,
@@ -5619,6 +6118,9 @@ function winnerPresentation(winner: Winner): {
 async function endGame(game: GameState, winner: Winner): Promise<void> {
   if (!isActiveGame(game)) return;
   clearGameTimers(game);
+  await restoreDivisionChannels(game, "ゲーム終了による分断解除").catch(
+    (error) => console.error("Division cleanup during game end failed:", error),
+  );
   game.phase = "ended";
   if (!game.analyticsCompleted) {
     game.analyticsCompleted = true;
@@ -5985,6 +6487,9 @@ export function prepareRematchGame(
     fatalWoundIds: new Set(),
     pendingDivision: undefined,
     divisionGroups: new Map(),
+    divisionChannels: undefined,
+    divisionPhaseMessages: undefined,
+    divisionOriginalViewPermissions: undefined,
     loquaciousMissions: new Map(),
     loquaciousCompleted: new Set(),
     votes: new Map(),
@@ -6116,7 +6621,8 @@ export async function handleComponent(
   const usesSeparateScope = resultActions.has(action) || isChainFeedback;
   if (!usesSeparateScope && !hasCurrentGameSession(game, sessionId)) {
     await interaction.reply({
-      content: "この試合の操作受付は終了しました。現在の試合画面を使用してください。",
+      content:
+        "この試合の操作受付は終了しました。現在の試合画面を使用してください。",
       ephemeral: true,
     });
     return;
@@ -6166,8 +6672,6 @@ export async function handleComponent(
       await handleRoleConfigButton(interaction, game);
     else if (action.startsWith("role-"))
       await handleRoleConfigAdjust(interaction, game, action);
-    else if (action === "loquacious-complete")
-      await handleLoquaciousComplete(interaction, game, Number(dayText));
     else if (action === "claim")
       await handleClaimButton(interaction, game, Number(dayText));
     else if (action === "claim-quick-seer")

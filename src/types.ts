@@ -145,8 +145,11 @@ export interface GameState {
   devoteeTargets?: Map<string, string>;
   usedRolePowers?: Set<string>;
   fatalWoundIds?: Set<string>;
-  pendingDivision?: { targetId: string; day: number };
+  pendingDivision?: { dividerId: string; targetId: string; day: number };
   divisionGroups?: Map<string, "A" | "B">;
+  divisionChannels?: Map<"A" | "B", TextChannel>;
+  divisionPhaseMessages?: Message[];
+  divisionOriginalViewPermissions?: Map<string, "allow" | "deny" | "inherit">;
   loquaciousMissions?: Map<string, string>;
   loquaciousCompleted?: Set<string>;
   timers: NodeJS.Timeout[];
