@@ -8,6 +8,7 @@ import {
   EmbedBuilder,
   GuildScheduledEventEntityType,
   GuildScheduledEventPrivacyLevel,
+  MessageFlags,
   ModalBuilder,
   ModalSubmitInteraction,
   PermissionFlagsBits,
@@ -492,7 +493,7 @@ export async function handleRecruitCommand(
   ) {
     await interaction.reply({
       content: "サーバーのテキストチャンネルで実行してください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -505,7 +506,7 @@ export async function handleRecruitCommand(
     await interaction.reply({
       content:
         "Botに「イベントを作成」と「メッセージを送信」の権限が必要です。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -528,7 +529,7 @@ export async function handleRecruitCommand(
     );
     await interaction.reply({
       content: `募集を作成した直後です。連続作成を防ぐため、あと${retryAfterSeconds}秒待ってください。`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -541,7 +542,7 @@ export async function handleRecruitCommand(
       if (existingSession.creating) {
         await interaction.reply({
           content: "すでに募集を作成中です。そのままお待ちください。",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -562,7 +563,7 @@ export async function handleRecruitCommand(
   };
   recruitSetupSessions.set(session.id, session);
 
-  await interaction.reply({ ...setupPanel(session), ephemeral: true });
+  await interaction.reply({ ...setupPanel(session), flags: MessageFlags.Ephemeral });
 }
 
 export async function handleRecruitSetupSelect(
@@ -577,7 +578,7 @@ export async function handleRecruitSetupSelect(
     await interaction.reply({
       content:
         "この募集設定は期限切れです。もう一度 `/recruit` を実行してください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -586,7 +587,7 @@ export async function handleRecruitSetupSelect(
   if (session.creating) {
     await interaction.reply({
       content: "募集を作成中です。そのままお待ちください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -645,7 +646,7 @@ export async function handleRecruitSetupSelect(
   if (!nextStartAt || nextStartAt.getTime() <= Date.now()) {
     await interaction.reply({
       content: "その開始日時は過去です。現在より後の日時を選んでください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -666,7 +667,7 @@ export async function handleRecruitSetupButton(
     await interaction.reply({
       content:
         "この募集設定は期限切れです。もう一度 `/recruit` を実行してください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -676,7 +677,7 @@ export async function handleRecruitSetupButton(
   if (session.creating) {
     await interaction.reply({
       content: "募集を作成中です。そのままお待ちください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -714,7 +715,7 @@ export async function handleRecruitSetupButton(
   if (session.startAt.getTime() <= Date.now()) {
     await interaction.reply({
       content: "開始日時が過ぎています。日時を選び直してください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -722,7 +723,7 @@ export async function handleRecruitSetupButton(
   if (!interaction.inGuild() || !interaction.guild) {
     await interaction.reply({
       content: "サーバー内で実行してください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -825,7 +826,7 @@ export async function handleRecruitSetupModal(
     await interaction.reply({
       content:
         "この募集設定は期限切れです。もう一度 `/recruit` を実行してください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -834,7 +835,7 @@ export async function handleRecruitSetupModal(
   if (session.creating) {
     await interaction.reply({
       content: "募集を作成中です。そのままお待ちください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -844,7 +845,7 @@ export async function handleRecruitSetupModal(
   if (!interaction.isFromMessage()) {
     await interaction.reply({
       content: "設定画面からもう一度操作してください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -853,7 +854,7 @@ export async function handleRecruitSetupModal(
   if (!value || value.length > 80) {
     await interaction.reply({
       content: "タイトルは1〜80文字で入力してください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }

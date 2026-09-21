@@ -1,4 +1,4 @@
-import { ChannelType } from "discord.js";
+import { ChannelType, MessageFlags } from "discord.js";
 import { describe, expect, it, vi } from "vitest";
 import {
   handleRecruitCommand,
@@ -128,7 +128,7 @@ describe("recruit setup", () => {
 
     expect(secondInteraction.reply).toHaveBeenCalledWith({
       content: "募集を作成中です。そのままお待ちください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     expect(secondInteraction.deferUpdate).not.toHaveBeenCalled();
     expect(guild.scheduledEvents.create).not.toHaveBeenCalled();
@@ -140,7 +140,7 @@ describe("recruit setup", () => {
     } as never);
     expect(repeatedCommandReply).toHaveBeenCalledWith({
       content: "すでに募集を作成中です。そのままお待ちください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
 
     finishChannelFetch(null);
@@ -230,7 +230,7 @@ describe("recruit setup", () => {
       content: expect.stringMatching(
         /^募集を作成した直後です。連続作成を防ぐため、あと\d+秒待ってください。$/,
       ),
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   });
 });

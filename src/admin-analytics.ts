@@ -1,6 +1,17 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { EmbedBuilder, type ChatInputCommandInteraction } from "discord.js";
+import {
+  EmbedBuilder,
+  MessageFlags,
+  type ChatInputCommandInteraction,
+} from "discord.js";
 import { isOwner } from "./access";
+import { analyticsAppVersion } from "./analytics";
+import {
+  buildLatestReleaseAnalytics,
+  type GameplayAnalyticsSummary,
+  type LatestReleaseAnalytics,
+} from "./match-analytics";
+import type { Winner } from "./types";
 
 const REQUEST_TIMEOUT_MS = 5000;
 const REPORT_DAYS = 7;
@@ -58,6 +69,9 @@ export interface PlayerSessionRow extends VersionAnalyticsRow {
   guild_id?: string | null;
   human_count?: NumericValue;
   status?: string | null;
+  winner?: Winner | null;
+  role_config?: Record<string, number> | null;
+  gameplay_summary?: GameplayAnalyticsSummary | null;
 }
 
 export interface ParticipantAnalyticsRow {
@@ -177,6 +191,7 @@ export interface AdminAnalyticsReport {
   sessions: SessionAnalyticsSummary;
   guildFunnel: GuildFunnelSummary;
   versions: Array<{ version: string; starts: number }>;
+  latestRelease: LatestReleaseAnalytics;
 }
 
 export function buildRetentionAnalyticsSummary(
@@ -552,7 +567,7 @@ export function buildGuildFunnelSummary(
 export function buildAdminAnalyticsReport(
   dailyRows: DailyAnalyticsRow[],
   abandonRows: AbandonAnalyticsRow[],
-  versionRows: VersionAnalyticsRow[],
+  versionRows: PlayerSessionRow[],
   players: PlayerAnalyticsSummary = {
     active: 0,
     newPlayers: 0,
@@ -580,6 +595,7 @@ export function buildAdminAnalyticsReport(
     [],
     analyticsRange(now),
   ),
+  currentVersion?: string,
 ): AdminAnalyticsReport {
   const range = analyticsRange(now);
   const currentRows = dailyRows.filter((row) =>
@@ -616,6 +632,10 @@ export function buildAdminAnalyticsReport(
     retention,
     sessions,
     guildFunnel,
+    latestRelease: buildLatestReleaseAnalytics(
+      versionRows,
+      currentVersion,
+    ),
     versions: [...versionCounts]
       .map(([version, starts]) => ({ version, starts }))
       .sort((left, right) => right.starts - left.starts),
@@ -703,21 +723,36 @@ async function loadPlayerSessionRows(
   startIso: string,
   endIso: string,
 ): Promise<PlayerSessionRow[]> {
-  const rows: PlayerSessionRow[] = [];
-  for (let offset = 0; ; offset += QUERY_PAGE_SIZE) {
-    const { data, error } = await client
-      .from("tomatobot_play_sessions")
-      .select("id,opened_at,started_at,app_version,guild_id,human_count,status")
-      .not("started_at", "is", null)
-      .gte("opened_at", startIso)
-      .lt("opened_at", endIso)
-      .order("opened_at", { ascending: true })
-      .order("id", { ascending: true })
-      .range(offset, offset + QUERY_PAGE_SIZE - 1);
-    if (error) throw error;
-    const page = (data ?? []) as PlayerSessionRow[];
-    rows.push(...page);
-    if (page.length < QUERY_PAGE_SIZE) return rows;
+  const extendedColumns =
+    "id,opened_at,started_at,app_version,guild_id,human_count,status,winner,role_config,gameplay_summary";
+  const legacyColumns =
+    "id,opened_at,started_at,app_version,guild_id,human_count,status,winner,role_config";
+  const loadColumns = async (columns: string): Promise<PlayerSessionRow[]> => {
+    const rows: PlayerSessionRow[] = [];
+    for (let offset = 0; ; offset += QUERY_PAGE_SIZE) {
+      const { data, error } = await client
+        .from("tomatobot_play_sessions")
+        .select(columns)
+        .not("started_at", "is", null)
+        .gte("opened_at", startIso)
+        .lt("opened_at", endIso)
+        .order("opened_at", { ascending: true })
+        .order("id", { ascending: true })
+        .range(offset, offset + QUERY_PAGE_SIZE - 1);
+      if (error) throw error;
+      const page = (data ?? []) as unknown as PlayerSessionRow[];
+      rows.push(...page);
+      if (page.length < QUERY_PAGE_SIZE) return rows;
+    }
+  };
+
+  try {
+    return await loadColumns(extendedColumns);
+  } catch (extendedError) {
+    console.warn(
+      `Gameplay analytics unavailable; using legacy session columns: ${errorMessage(extendedError)}`,
+    );
+    return loadColumns(legacyColumns);
   }
 }
 
@@ -830,6 +865,7 @@ export async function getAdminAnalytics(
         now,
         guildFunnel,
         retention,
+        analyticsAppVersion(),
       ),
     };
   } catch (error) {
@@ -885,6 +921,53 @@ function versionLabel(version: string): string {
     return `${releaseWithCommit[1]}（${releaseWithCommit[2].slice(0, 7)}）`;
   if (/^[0-9a-f]{7,}$/i.test(version)) return version.slice(0, 7);
   return version.length > 24 ? `${version.slice(0, 23)}…` : version;
+}
+
+const ACTION_LABELS: Record<string, string> = {
+  kill: "襲撃",
+  guard: "護衛",
+  seer: "占い",
+  flee: "逃亡",
+  assassinate: "暗殺",
+  sorcery: "妖術",
+  divide: "分断",
+  compass: "方位",
+  cupid: "恋人指定",
+  devotee: "純愛指定",
+  thief: "怪盗",
+};
+
+function latestReleaseText(latest: LatestReleaseAnalytics): string {
+  if (!latest.version) return "バージョンを特定できません。";
+  const lines = [
+    `対象 **${versionLabel(latest.version)}**｜開始 **${latest.started}**｜完走 **${latest.completed}**`,
+  ];
+  if (latest.completed === 0) {
+    lines.push("この更新後の完走データはまだありません。勝率調整は保留します。");
+    return lines.join("\n");
+  }
+  lines.push(
+    `村 **${latest.wins.villager}**｜狼 **${latest.wins.wolf}**｜狐 **${latest.wins.fox}**｜恋 **${latest.wins.lovers}**｜てるてる **${latest.wins.teruteru}**`,
+  );
+  if (latest.telemetryMatches > 0) {
+    lines.push(
+      `匿名計測 **${latest.telemetryMatches}戦**｜CO **${latest.claims.total}**（人 ${latest.claims.human}・NPC ${latest.claims.npc}）｜撤回 **${latest.retractions}**`,
+    );
+    const actions = Object.entries(latest.nightActions)
+      .filter(([, count]) => count.total > 0)
+      .sort((left, right) => right[1].total - left[1].total)
+      .slice(0, 6)
+      .map(
+        ([action, count]) =>
+          `${ACTION_LABELS[action] ?? action} ${count.total}（NPC ${count.npc}）`,
+      );
+    if (actions.length) lines.push(`夜能力｜${actions.join("｜")}`);
+  } else {
+    lines.push("CO・能力の匿名計測は移行SQL適用後の試合から始まります。");
+  }
+  if (latest.completed < 30)
+    lines.push("※ 30完走未満のため、勝率による強弱調整は保留");
+  return lines.join("\n");
 }
 
 function comparisonLine(
@@ -1004,6 +1087,10 @@ export function adminAnalyticsEmbed(
           : "報告なし",
       },
       {
+        name: "最新版の実戦",
+        value: latestReleaseText(report.latestRelease),
+      },
+      {
         name: "前週比",
         value: comparisonLine(
           current,
@@ -1018,7 +1105,7 @@ export function adminAnalyticsEmbed(
       },
     )
     .setFooter({
-      text: "個人名・Discord ID・会話内容・役職・投票先は表示していません",
+      text: "個人名・Discord ID・会話内容・個人ごとの役職・投票先は表示していません",
     });
 }
 
@@ -1028,12 +1115,12 @@ export async function handleAdminAnalyticsCommand(
   if (!isOwner(interaction.user.id)) {
     await interaction.reply({
       content: "このコマンドは運営者専用です。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const result = await getAdminAnalytics();
   if (result.status === "disabled") {
     await interaction.editReply(

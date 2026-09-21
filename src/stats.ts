@@ -3,6 +3,7 @@ import {
   ChatInputCommandInteraction,
   EmbedBuilder,
   escapeMarkdown,
+  MessageFlags,
 } from "discord.js";
 import { ROLE_INFO, ROLE_NAMES } from "./roles";
 import { rankingSettingsRow } from "./ranking";
@@ -311,7 +312,7 @@ export function gameStatsFields(
 export async function showStats(
   interaction: ChatInputCommandInteraction,
 ): Promise<void> {
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const result = await getPlayerStats(interaction.user.id);
 
   if (result.status === "found") {

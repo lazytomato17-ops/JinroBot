@@ -1,4 +1,8 @@
-import { ChannelType, GuildScheduledEventStatus } from "discord.js";
+import {
+  ChannelType,
+  GuildScheduledEventStatus,
+  MessageFlags,
+} from "discord.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createLobby } from "./game";
 import { handleRecruitStartButton } from "./recruit-start";
@@ -71,7 +75,9 @@ describe("scheduled event lobby start", () => {
     await handleRecruitStartButton(interaction as never);
 
     expect(calls).toEqual(["defer", "event", "subscribers", "lobby"]);
-    expect(interaction.deferReply).toHaveBeenCalledWith({ ephemeral: true });
+    expect(interaction.deferReply).toHaveBeenCalledWith({
+      flags: MessageFlags.Ephemeral,
+    });
     expect(send).toHaveBeenCalledWith(
       expect.objectContaining({
         content: expect.stringContaining("「参加する」"),

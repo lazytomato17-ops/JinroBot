@@ -3,6 +3,7 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  MessageFlags,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
 } from "discord.js";
@@ -284,7 +285,7 @@ export async function handleRankingButton(
   interaction: ButtonInteraction,
 ): Promise<void> {
   if (!isRankingButton(interaction.customId)) return;
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const action: RankingAction =
     interaction.customId === RANKING_JOIN_BUTTON_ID ? "join" : "leave";
   await interaction.editReply(
@@ -299,7 +300,7 @@ export async function handleRankingButton(
 export async function handleRankingCommand(
   interaction: ChatInputCommandInteraction,
 ): Promise<void> {
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const action = interaction.options.getSubcommand() as RankingAction;
   await interaction.editReply(
     await changeRankingParticipation(

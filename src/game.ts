@@ -8,6 +8,7 @@ import {
   EmbedBuilder,
   escapeMarkdown,
   Message,
+  MessageFlags,
   ModalBuilder,
   ModalSubmitInteraction,
   PermissionFlagsBits,
@@ -35,6 +36,7 @@ import {
   type FeedbackReason,
   type PlaySessionSnapshot,
 } from "./analytics";
+import { buildGameplayAnalyticsSummary } from "./match-analytics";
 import {
   buildCustomRoles,
   buildRoles,
@@ -1600,10 +1602,10 @@ async function replyLobbyError(
     return;
   }
   if (interaction.replied) {
-    await interaction.followUp({ content, ephemeral: true });
+    await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
     return;
   }
-  await interaction.reply({ content, ephemeral: true });
+  await interaction.reply({ content, flags: MessageFlags.Ephemeral });
 }
 
 export async function createLobby(
@@ -1750,7 +1752,7 @@ export async function createLobby(
         .catch(() => undefined);
     } else {
       await interaction
-        .reply({ content: failure, ephemeral: true })
+        .reply({ content: failure, flags: MessageFlags.Ephemeral })
         .catch(() => undefined);
     }
     console.error("Lobby creation failed:", error);
@@ -1847,6 +1849,7 @@ export async function resetChannel(
       startedAt: game.analyticsStartedAt
         ? new Date(game.analyticsStartedAt).toISOString()
         : undefined,
+      gameplaySummary: buildGameplayAnalyticsSummary(game),
     };
     queueAnalytics(game, () => recordGameAbandoned(analytics));
     if (
@@ -1910,21 +1913,21 @@ async function handleAbandonReasonButton(
     pendingAbandonReasons.delete(sessionId);
     await interaction.reply({
       content: "この回答受付は終了しました。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
   if (pending.userId !== interaction.user.id) {
     await interaction.reply({
       content: "ゲームを終了した本人だけが回答できます。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
   if (pending.submitting) {
     await interaction.reply({
       content: "回答を保存しています。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -1989,7 +1992,7 @@ async function handleJoin(
   if (game.phase !== "lobby" || lobbyConfigurationLocked(game)) {
     await interaction.reply({
       content: "募集は終了しています。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -2004,14 +2007,14 @@ async function handleJoin(
     if (index < 0) {
       await interaction.reply({
         content: "現在このゲームには参加していません。",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
     if (interaction.user.id === game.hostId) {
       await interaction.reply({
         content: "ホストは退出できません。募集を中止してください。",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -2020,7 +2023,7 @@ async function handleJoin(
     if (index >= 0) {
       await interaction.reply({
         content: "すでに参加しています。",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -2028,7 +2031,7 @@ async function handleJoin(
     if (humanCount >= game.targetPlayerCount) {
       await interaction.reply({
         content: `このゲームは${game.targetPlayerCount}人設定です。`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -2058,14 +2061,14 @@ async function handlePlayerCountChange(
   if (interaction.user.id !== game.hostId) {
     await interaction.reply({
       content: "プレイ人数を変更できるのはホストだけです。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
   if (game.phase !== "lobby" || lobbyConfigurationLocked(game)) {
     await interaction.reply({
       content: "ゲーム開始後は人数を変更できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -2075,14 +2078,14 @@ async function handlePlayerCountChange(
   if (!Number.isInteger(count) || count < MIN_PLAYERS || count > MAX_PLAYERS) {
     await interaction.reply({
       content: "プレイ人数は4〜15人から選んでください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
   if (count < humans.length) {
     await interaction.reply({
       content: `現在${humans.length}人が参加中のため、それ未満にはできません。`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -2111,7 +2114,7 @@ async function handlePlayerCountChange(
     await interaction.followUp({
       content:
         "新しい人数では元の配役が成立しないため、配役を標準構成に戻しました。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 }
@@ -2250,7 +2253,7 @@ async function handleRoleConfigSelect(
   ) {
     await interaction.reply({
       content: "現在は配役を変更できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -2258,7 +2261,7 @@ async function handleRoleConfigSelect(
   if (!role) {
     await interaction.reply({
       content: "役職を選び直してください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -2272,19 +2275,19 @@ async function handleRoleConfigButton(
   if (interaction.user.id !== game.hostId) {
     await interaction.reply({
       content: "配役を変更できるのはホストだけです。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
   if (game.phase !== "lobby" || lobbyConfigurationLocked(game)) {
     await interaction.reply({
       content: "ゲーム開始後は配役を変更できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
 
-  await interaction.reply({ ...roleConfigPanel(game), ephemeral: true });
+  await interaction.reply({ ...roleConfigPanel(game), flags: MessageFlags.Ephemeral });
 }
 
 async function handleRoleConfigAdjust(
@@ -2299,7 +2302,7 @@ async function handleRoleConfigAdjust(
   ) {
     await interaction.reply({
       content: "現在は配役を変更できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -2309,7 +2312,7 @@ async function handleRoleConfigAdjust(
   if (!match || !configRole) {
     await interaction.reply({
       content: "その設定は変更できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -2328,7 +2331,7 @@ async function handleRoleConfigAdjust(
     await interaction.reply({
       content:
         error instanceof Error ? error.message : "配役を確認してください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -2344,21 +2347,21 @@ async function handleStart(
   if (interaction.user.id !== game.hostId) {
     await interaction.reply({
       content: "ゲームを開始できるのは主催者だけです。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
   if (game.phase !== "lobby" || game.analyticsStartedAt) {
     await interaction.reply({
       content: "ゲームは既に始まっています。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
   if (game.starting) {
     await interaction.reply({
       content: "ゲーム開始を処理中です。少し待ってください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -2366,7 +2369,7 @@ async function handleStart(
     await interaction.reply({
       content:
         "分断者を使うには、Botロールへ「チャンネル管理」権限を付けてください。「サーバー管理」権限は不要です。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -2391,14 +2394,14 @@ async function handleCancel(
   if (interaction.user.id !== game.hostId) {
     await interaction.reply({
       content: "募集を中止できるのは主催者だけです。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
   if (game.phase !== "lobby" || game.analyticsStartedAt) {
     await interaction.reply({
       content: "ゲーム開始後は `/reset` を使用してください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -2947,7 +2950,7 @@ async function handleClaimListButton(
   ) {
     await interaction.reply({
       content: "現在はCO・判定一覧を確認できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -2961,7 +2964,7 @@ async function handleClaimListButton(
     : undefined;
   await interaction.reply({
     embeds: [claimListEmbed(game, visibleSpeakerIds)],
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -3036,11 +3039,11 @@ async function handleClaimButton(
   if (game.phase !== "day" || day !== game.day || !claimant) {
     await interaction.reply({
       content: "現在は役職COできません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
-  await interaction.reply({ ...claimPanel(game, claimant), ephemeral: true });
+  await interaction.reply({ ...claimPanel(game, claimant), flags: MessageFlags.Ephemeral });
 }
 
 async function handleQuickResultClaim(
@@ -3053,7 +3056,7 @@ async function handleQuickResultClaim(
   if (game.phase !== "day" || day !== game.day || !claimant) {
     await interaction.reply({
       content: "現在は結果を公開できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -3119,7 +3122,7 @@ async function handleQuickRoleDeclaration(
   ) {
     await interaction.reply({
       content: "現在はその役職COを公開できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -3157,7 +3160,7 @@ async function handleCustomClaimOpen(
   ) {
     await interaction.reply({
       content: "現在はCO内容を設定できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -3217,7 +3220,7 @@ async function handleClaimRetractionPrompt(
   if (game.phase !== "day" || day !== game.day || !claimant || !claimedRole) {
     await interaction.reply({
       content: "現在取り消せるCOはありません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -3236,7 +3239,7 @@ async function handleClaimRetractionConfirm(
   if (game.phase !== "day" || day !== game.day || !claimant) {
     await interaction.reply({
       content: "現在COを取り消せません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -3279,7 +3282,7 @@ async function handleClaimRole(
   if (game.phase !== "day" || day !== game.day || !claimant || !requestedRole) {
     await interaction.reply({
       content: "現在は役職COできません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -3368,7 +3371,7 @@ async function handleClaimTarget(
   ) {
     await interaction.reply({
       content: "そのCOは公開できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -3420,7 +3423,7 @@ async function handleClaimResult(
   ) {
     await interaction.reply({
       content: "そのCOは公開できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4129,7 +4132,7 @@ async function handleSuspectOpen(
   if (game.phase !== "day" || game.day !== day || !actor) {
     await interaction.reply({
       content: "現在は意見を表明できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4142,7 +4145,7 @@ async function handleSuspectOpen(
   if (targets.length === 0) {
     await interaction.reply({
       content: "指定できる相手がいません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4156,7 +4159,7 @@ async function handleSuspectOpen(
     components: [
       new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu),
     ],
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -4169,7 +4172,7 @@ async function handleVoteOpen(
   if (game.phase !== "voting" || game.resolving || game.day !== day || !voter) {
     await interaction.reply({
       content: "現在は投票できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4180,7 +4183,7 @@ async function handleVoteOpen(
   if (targets.length === 0) {
     await interaction.reply({
       content: "投票できる相手がいません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4199,7 +4202,7 @@ async function handleVoteOpen(
     components: [
       new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu),
     ],
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -4212,7 +4215,7 @@ async function handleNpcQuestionOpen(
   if (game.phase !== "day" || game.day !== day || !actor) {
     await interaction.reply({
       content: "現在はNPCに質問できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4221,7 +4224,7 @@ async function handleNpcQuestionOpen(
   if (remaining === 0) {
     await interaction.reply({
       content: "今日の質問は2回とも使いました。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4235,7 +4238,7 @@ async function handleNpcQuestionOpen(
   if (npcs.length === 0) {
     await interaction.reply({
       content: "質問できるNPCがいません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4249,7 +4252,7 @@ async function handleNpcQuestionOpen(
     components: [
       new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu),
     ],
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -4266,14 +4269,14 @@ async function handleNpcQuestion(
   if (game.phase !== "day" || game.day !== day || !actor || !npc) {
     await interaction.reply({
       content: "現在はNPCに質問できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
   if (!sharesDiscussionRoom(game, actor, npc)) {
     await interaction.reply({
       content: "別の分断部屋にいるNPCには質問できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4281,7 +4284,7 @@ async function handleNpcQuestion(
   if (remainingNpcQuestions(game, actor.id) === 0) {
     await interaction.reply({
       content: "今日の質問は2回とも使いました。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4293,7 +4296,7 @@ async function handleNpcQuestion(
   if (!answer || (answer.targetId && !target)) {
     await interaction.reply({
       content: "いま聞ける意見がありません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4308,7 +4311,7 @@ async function handleNpcQuestion(
       remaining > 0
         ? `回答を公開しました。今日はあと${remaining}回質問できます。`
         : "回答を公開しました。今日の質問はこれで終了です。",
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
   await sendDiscussionMessage(
     game,
@@ -4338,14 +4341,14 @@ async function handleSuspect(
   ) {
     await interaction.reply({
       content: "現在は意見を表明できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
   if (actor.id === target.id) {
     await interaction.reply({
       content: "自分自身は指定できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4393,7 +4396,7 @@ async function handleSuspectReason(
   ) {
     await interaction.reply({
       content: "現在はその意見を表明できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4450,7 +4453,7 @@ async function handleVote(
   ) {
     await interaction.reply({
       content: "現在は投票できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4459,7 +4462,7 @@ async function handleVote(
   if (targetId === voter.id) {
     await interaction.reply({
       content: "自分自身には投票できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4469,7 +4472,7 @@ async function handleVote(
   ) {
     await interaction.reply({
       content: "その人には投票できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -4477,7 +4480,7 @@ async function handleVote(
   game.votes.set(voter.id, targetId);
   await interaction.reply({
     content: "投票を受け付けました。",
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
   await updateVoteProgress(game);
 
@@ -5455,7 +5458,7 @@ async function handleNightAction(
   ) {
     await interaction.reply({
       content: "この夜行動は現在使用できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -5467,7 +5470,7 @@ async function handleNightAction(
   ) {
     await interaction.reply({
       content: "今夜の結果確認はすでに確定しています。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -5476,7 +5479,7 @@ async function handleNightAction(
     if (action !== "assassinate" && action !== "divide") {
       await interaction.reply({
         content: "この能力は見送れません。",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -5508,7 +5511,7 @@ async function handleNightAction(
   ) {
     await interaction.reply({
       content: "対象を選び直してください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -6415,7 +6418,7 @@ async function handleFeedbackButton(
   if (!feedbackParticipant(game, interaction.user.id)) {
     await interaction.reply({
       content: "この試合に参加したプレイヤーだけが回答できます。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -6423,7 +6426,7 @@ async function handleFeedbackButton(
   if (game.analyticsFeedbackSubmittedUserIds?.has(interaction.user.id)) {
     await interaction.reply({
       content: "この連戦では回答済みです。ありがとう！",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -6432,12 +6435,12 @@ async function handleFeedbackButton(
     await interaction.reply({
       content: "いちばん近い理由を1つ選んでください。",
       components: feedbackReasonRows(game, rating),
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const content = await submitFeedback(game, interaction.user.id, rating);
   await interaction.editReply({ content });
 }
@@ -6451,7 +6454,7 @@ async function handleFeedbackReason(
   if (!feedbackParticipant(game, interaction.user.id)) {
     await interaction.reply({
       content: "この試合に参加したプレイヤーだけが回答できます。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -6500,7 +6503,7 @@ async function handleFeedbackModal(
   if (!feedbackParticipant(game, interaction.user.id)) {
     await interaction.reply({
       content: "この試合の感想受付は終了しました。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -6508,7 +6511,7 @@ async function handleFeedbackModal(
   const comment = interaction.fields
     .getTextInputValue("feedback-comment")
     .trim();
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const content = await submitFeedback(
     game,
     interaction.user.id,
@@ -6526,21 +6529,21 @@ async function handlePostgameRecap(
   if (game.phase !== "ended") {
     await interaction.reply({
       content: "試合終了後に振り返りを表示できます。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
   if (game.postgameRecapState === "shown") {
     await interaction.reply({
       content: "この試合の振り返りはすでに表示されています。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
   if (game.postgameRecapState === "showing") {
     await interaction.reply({
       content: "振り返りを表示しています。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -6628,14 +6631,14 @@ async function handleRematch(
   if (interaction.user.id !== game.hostId) {
     await interaction.reply({
       content: "再戦を始められるのは主催者だけです。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
   if (game.phase !== "ended") {
     await interaction.reply({
       content: "現在は再戦できません。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -6704,7 +6707,7 @@ export async function handleComponent(
     await interaction.reply({
       content:
         "このゲームは終了しているか、Botの再起動で進行情報が失われました。もう一度 `/jinro` から開始してください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -6716,7 +6719,7 @@ export async function handleComponent(
     await interaction.reply({
       content:
         "この試合の操作受付は終了しました。現在の試合画面を使用してください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -6731,7 +6734,7 @@ export async function handleComponent(
       if (dayText !== game.analyticsChainId) {
         await interaction.reply({
           content: "この連戦の感想受付は終了しました。",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -6748,14 +6751,14 @@ export async function handleComponent(
     if (resultActions.has(action) && dayText !== game.analyticsSessionId) {
       await interaction.reply({
         content: "この試合の操作受付は終了しました。",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
     if (action.startsWith("feedback-") && dayText !== game.analyticsChainId) {
       await interaction.reply({
         content: "この連戦の感想受付は終了しました。",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
