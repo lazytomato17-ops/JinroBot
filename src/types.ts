@@ -34,7 +34,7 @@ export type RoleTeam = "villager" | "wolf" | "third";
 export type NpcPersonality = "慎重" | "直感" | "追及" | "同調";
 export type NpcSeerClaimPlan = "day1" | "day2" | "never";
 export type PublicResult = "人狼" | "人間";
-export type ClaimedRole = "占い師" | "霊能者" | "騎士";
+export type ClaimedRole = RoleName;
 export type HumanArgumentReason =
   | "black-result"
   | "vote-contradiction"

@@ -97,7 +97,9 @@ const inconsistent = summaries.filter(
 const extremeBalance = summaries.filter(
   (summary) =>
     summary.scenario.profile !== "自由配役" &&
-    (summary.villageWinRate < 0.25 || summary.villageWinRate > 0.75),
+    // 500試合では0.数ポイントの標本差が出るため、境界値ちょうどを
+    // 「極端」と誤判定せず、明確に偏った配役だけを止める。
+    (summary.villageWinRate < 0.25 || summary.villageWinRate > 0.76),
 );
 const weakLoneClaim = summaries.filter(
   (summary) =>

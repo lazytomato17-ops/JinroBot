@@ -9,9 +9,11 @@ import {
   availableTrueMediumClaims,
   availableTrueSeerClaims,
   canResetGame,
+  chooseNpcAssassinationTarget,
   claimedRoleForPlayer,
   claimListEmbed,
   claimPanel,
+  claimRoleRows,
   completeLoquaciousMissionForMessage,
   dayEmbed,
   divisionGroupsForPlayers,
@@ -37,6 +39,7 @@ import {
   npcDecisionSuspicion,
   npcDiscussionSpeakers,
   npcFakeSeerClaimDays,
+  npcPublicRoleClaim,
   npcQuestionLine,
   publicResultForRole,
   postgameRecapBatches,
@@ -48,6 +51,7 @@ import {
   recordCurrentVoteRound,
   recordNightHistory,
   recordRoleClaim,
+  recordRoleDeclaration,
   retractPlayerClaim,
   remainingNpcQuestions,
   remainingClaimSlots,
@@ -70,7 +74,7 @@ import {
   wolfChatRelayPayload,
 } from "./game";
 import { roleConfigFromRoles } from "./roles";
-import { buildSoloRoles } from "./solo";
+import { buildSoloRoles, chooseNpcVoteTarget } from "./solo";
 import type { GameState, Player, RoleName } from "./types";
 
 function makeGame(
@@ -665,6 +669,72 @@ describe("ゲーム画面", () => {
     );
   });
 
+  it("初日の単独占いCOは村人陣営NPCが理由なく投票対象にしにくい", () => {
+    const game = makeGame(["村人", "村人", "占い師", "人狼"]);
+    const observer = game.players[1];
+    const claimant = game.players[2];
+    observer.npcPersonality = "慎重";
+    game.npcClaims.push({
+      day: 1,
+      speakerId: claimant.id,
+      claimedRole: "占い師",
+      targetId: game.players[0].id,
+      result: "人間",
+    });
+
+    const suspicion = npcDecisionSuspicion(game, observer);
+    expect(suspicion.get(claimant.id)).toBe(-2.5);
+    expect(
+      chooseNpcVoteTarget(
+        observer,
+        game.players.filter((player) => player.id !== observer.id),
+        suspicion,
+        () => 0.99,
+      ),
+    ).not.toBe(claimant.id);
+  });
+
+  it("人狼陣営NPCには初日の単独占いCO保護を適用しない", () => {
+    const game = makeGame(["村人", "村人", "占い師", "人狼"]);
+    const claimant = game.players[2];
+    const wolf = game.players[3];
+    wolf.npcPersonality = "慎重";
+    game.npcClaims.push({
+      day: 1,
+      speakerId: claimant.id,
+      claimedRole: "占い師",
+      targetId: game.players[0].id,
+      result: "人間",
+    });
+
+    expect(npcDecisionSuspicion(game, wolf).get(claimant.id)).toBeUndefined();
+  });
+
+  it("初日でも破綻した単独占いCOは保護しない", () => {
+    const game = makeGame(["村人", "村人", "占い師", "人狼"]);
+    const observer = game.players[1];
+    const claimant = game.players[2];
+    observer.npcPersonality = "追及";
+    game.npcClaims.push(
+      {
+        day: 1,
+        speakerId: claimant.id,
+        claimedRole: "占い師",
+        targetId: game.players[0].id,
+        result: "人狼",
+      },
+      {
+        day: 1,
+        speakerId: claimant.id,
+        claimedRole: "占い師",
+        targetId: game.players[1].id,
+        result: "人狼",
+      },
+    );
+
+    expect(npcDecisionSuspicion(game, observer).get(claimant.id)).toBe(0.8);
+  });
+
   it("占い師COが複数なら黒判定へ一人COの信用補正を付けない", () => {
     const game = makeGame();
     game.players[1].npcPersonality = "慎重";
@@ -1002,17 +1072,36 @@ describe("ゲーム画面", () => {
     expect(componentJson).not.toContain("claim-role");
   });
 
-  it("本当の公開結果がない人は最初からCO役職を選べる", () => {
+  it("本当の公開結果がない人は実役職COと騙りを選べる", () => {
     const game = makeGame(["村人", "人狼", "占い師", "村人"]);
     const panel = claimPanel(game, game.players[0]);
     const componentJson = JSON.stringify(
       panel.components?.map((row) => row.toJSON()),
     );
 
-    expect(panel.content).toBe("**COする役職を選んでください。**");
-    expect(componentJson).toContain("claim-role");
-    expect(componentJson).not.toContain("claim-custom-open");
+    expect(panel.content).toBe("**村人COしますか？**");
+    expect(componentJson).toContain("claim-quick-role-0");
+    expect(componentJson).toContain("村人COする");
+    expect(componentJson).toContain("claim-custom-open");
     expect(componentJson).not.toContain("claim-day-");
+  });
+
+  it("26役職のCO選択をDiscord上限内の2メニューに分ける", () => {
+    const rows = claimRoleRows(makeGame());
+    const menus = rows.map((row) => row.toJSON().components[0]);
+    const options = menus.flatMap((menu) =>
+      "options" in menu && menu.options ? menu.options : [],
+    );
+
+    expect(rows).toHaveLength(2);
+    expect(
+      menus.every(
+        (menu) => !("options" in menu) || (menu.options?.length ?? 0) <= 25,
+      ),
+    ).toBe(true);
+    expect(options).toHaveLength(26);
+    expect(options.map((option) => option.label)).toContain("共有者CO");
+    expect(options.map((option) => option.label)).toContain("てるてるCO");
   });
 
   it("CO済みなら日付選択を挟まず次の判定相手を選べる", () => {
@@ -1062,7 +1151,7 @@ describe("ゲーム画面", () => {
     const componentJson = JSON.stringify(
       claimPanel(game, game.players[0]).components?.map((row) => row.toJSON()),
     );
-    expect(componentJson).toContain("claim-quick-guard");
+    expect(componentJson).toContain("claim-quick-role-4");
     expect(componentJson).toContain("騎士COする");
     expect(componentJson).toContain("claim-custom-open");
   });
@@ -1161,6 +1250,18 @@ describe("ゲーム画面", () => {
     expect(roleDeclarationLine(game.players[0], "騎士")).toContain(
       "（プレイヤー）　🛡️ 騎士CO",
     );
+    expect(roleDeclarationLine(game.players[0], "共有者")).toContain(
+      "（プレイヤー）　🤝 共有者CO",
+    );
+  });
+
+  it("追加役職のCOを記録・一覧表示・取り消しできる", () => {
+    const game = makeGame(["共有者", "共有者", "人狼", "村人"]);
+    expect(recordRoleDeclaration(game, game.players[0], "共有者")).toBe(true);
+    expect(claimedRoleForPlayer(game, "0")).toBe("共有者");
+    expect(JSON.stringify(claimListEmbed(game).toJSON())).toContain("共有者");
+    expect(retractPlayerClaim(game, "0")).toBe("共有者");
+    expect(claimedRoleForPlayer(game, "0")).toBeUndefined();
   });
 
   it("CO済みNPCと本物の占い師を翌日も発言者に含める", () => {
@@ -1179,6 +1280,15 @@ describe("ゲーム画面", () => {
     );
     expect(speakerIds).toContain("1");
     expect(speakerIds).toContain("2");
+  });
+
+  it("公開情報型の追加役職NPCは適切な日からCO候補になる", () => {
+    const game = makeGame(["人狼", "共有者", "共有者", "パン屋", "市長"]);
+    expect(npcPublicRoleClaim(game, game.players[1])).toBe("共有者");
+    expect(npcPublicRoleClaim(game, game.players[3])).toBe("パン屋");
+    expect(npcPublicRoleClaim(game, game.players[4])).toBeUndefined();
+    game.day = 2;
+    expect(npcPublicRoleClaim(game, game.players[4])).toBe("市長");
   });
 
   it("自由配役ではCO対象を全員通し、通常発言者だけ指定人数に抑える", () => {
@@ -1632,6 +1742,41 @@ describe("ゲーム画面", () => {
     expect(nightActionForPlayer(compassGame, compassGame.players[0])).toBe(
       "compass",
     );
+  });
+
+  it("NPC暗殺者は公開上の疑いが強い相手を優先して使う", () => {
+    const game = makeGame(["暗殺者", "人狼", "占い師", "村人"]);
+    const assassin = game.players[0];
+    assassin.isNpc = true;
+    assassin.npcPersonality = "追及";
+    game.day = 2;
+    game.npcSuspicion.set(game.players[1].id, 2.5);
+
+    expect(
+      chooseNpcAssassinationTarget(
+        game,
+        assassin,
+        game.players.slice(1),
+        () => 0,
+      )?.id,
+    ).toBe(game.players[1].id);
+  });
+
+  it("NPC暗殺者は根拠が薄ければ能力を見送れる", () => {
+    const game = makeGame(["暗殺者", "人狼", "占い師", "村人"]);
+    const assassin = game.players[0];
+    assassin.isNpc = true;
+    assassin.npcPersonality = "慎重";
+    game.day = 2;
+
+    expect(
+      chooseNpcAssassinationTarget(
+        game,
+        assassin,
+        game.players.slice(1),
+        () => 0.99,
+      ),
+    ).toBeUndefined();
   });
 
   it("饒舌な人狼は実際の議論メッセージにお題を含めると達成する", () => {
