@@ -940,15 +940,19 @@ export function recordRoleClaim(
   return true;
 }
 
-function recordGuardDeclaration(game: GameState, speaker: Player): boolean {
-  const declaration = `${game.day}:${speaker.id}:騎士`;
+export function recordRoleDeclaration(
+  game: GameState,
+  speaker: Player,
+  claimedRole: Exclude<ClaimedRole, "占い師" | "霊能者">,
+): boolean {
+  const declaration = `${game.day}:${speaker.id}:${claimedRole}`;
   if (game.roleDeclarations.has(declaration)) return false;
   game.roleDeclarations.add(declaration);
   game.claimHistory.push({
     action: "claim",
     day: game.day,
     speakerId: speaker.id,
-    claimedRole: "騎士",
+    claimedRole,
   });
   return true;
 }
@@ -961,10 +965,12 @@ export function claimedRoleForPlayer(
     (claim) => claim.speakerId === playerId,
   );
   if (resultClaim) return resultClaim.claimedRole;
-  return [...game.roleDeclarations].some(
-    (declaration) => declaration.split(":")[1] === playerId,
-  )
-    ? "騎士"
+  const declaration = [...game.roleDeclarations].find(
+    (entry) => entry.split(":")[1] === playerId,
+  );
+  const declaredRole = declaration?.split(":")[2] as RoleName | undefined;
+  return declaredRole && ROLE_NAMES.includes(declaredRole)
+    ? declaredRole
     : undefined;
 }
 
@@ -1054,6 +1060,24 @@ function hasNpcClaimedRole(
   return claimedRoleForPlayer(game, npcId) === claimedRole;
 }
 
+const NPC_PUBLIC_ROLE_CLAIM_DAY: Partial<Record<RoleName, number>> = {
+  共有者: 1,
+  パン屋: 1,
+  検死官: 2,
+  市長: 2,
+};
+
+export function npcPublicRoleClaim(
+  game: GameState,
+  npc: Player,
+): Exclude<ClaimedRole, "占い師" | "霊能者"> | undefined {
+  if (!npc.isNpc || !npc.role || claimedRoleForPlayer(game, npc.id))
+    return undefined;
+  if (npc.role === "占い師" || npc.role === "霊能者") return undefined;
+  const claimDay = NPC_PUBLIC_ROLE_CLAIM_DAY[npc.role];
+  return claimDay !== undefined && game.day >= claimDay ? npc.role : undefined;
+}
+
 export function npcDiscussionSpeakers(
   game: GameState,
   maxOrdinarySpeakers: number,
@@ -1063,6 +1087,7 @@ export function npcDiscussionSpeakers(
     (npc) =>
       npc.role === "占い師" ||
       (npc.role === "霊能者" && Boolean(game.lastExecuted)) ||
+      npcPublicRoleClaim(game, npc) !== undefined ||
       hasNpcClaimedRole(game, npc.id, "占い師") ||
       hasNpcClaimedRole(game, npc.id, "霊能者") ||
       npcSeerClaimPlanStartsOnDay(game.npcSeerClaimPlans.get(npc.id), game.day),
@@ -1101,14 +1126,17 @@ export function roleClaimLine(
 }
 
 function roleRetractionLine(speaker: Player, claimedRole: ClaimedRole): string {
-  return `**${safeName(speaker)}**（${speaker.isNpc ? "NPC" : "プレイヤー"}）　↩️ ${claimedRole}COを取り消しました。これまでの判定は無効です。`;
+  const resultNote = isResultClaimRole(claimedRole)
+    ? "これまでの判定は無効です。"
+    : "別の役職でCOし直せます。";
+  return `**${safeName(speaker)}**（${speaker.isNpc ? "NPC" : "プレイヤー"}）　↩️ ${claimedRole}COを取り消しました。${resultNote}`;
 }
 
 export function roleDeclarationLine(
   speaker: Player,
-  claimedRole: "騎士",
+  claimedRole: Exclude<ClaimedRole, "占い師" | "霊能者">,
 ): string {
-  return `**${safeName(speaker)}**（${speaker.isNpc ? "NPC" : "プレイヤー"}）　🛡️ ${claimedRole}CO`;
+  return `**${safeName(speaker)}**（${speaker.isNpc ? "NPC" : "プレイヤー"}）　${ROLE_INFO[claimedRole].icon} ${claimedRole}CO`;
 }
 
 function publicPlayerLabel(player: Player): string {
@@ -1165,12 +1193,17 @@ function resultClaimRows(
   });
 }
 
-function guardClaimRows(game: GameState): string[] {
+function roleDeclarationRows(game: GameState): string[] {
   return [...game.roleDeclarations].slice(-30).flatMap((declaration) => {
     const [dayText, speakerId, claimedRole] = declaration.split(":");
-    if (claimedRole !== "騎士") return [];
+    if (!ROLE_NAMES.includes(claimedRole as RoleName)) return [];
     const speaker = game.players.find((player) => player.id === speakerId);
-    return speaker ? [`${dayText}日目　${publicPlayerLabel(speaker)}`] : [];
+    const role = claimedRole as RoleName;
+    return speaker
+      ? [
+          `${dayText}日目　${publicPlayerLabel(speaker)}　${ROLE_INFO[role].icon} ${role}`,
+        ]
+      : [];
   });
 }
 
@@ -1238,7 +1271,10 @@ export function claimListEmbed(
         resultClaimFieldName(visibleGame, "霊能者"),
         resultClaimRows(visibleGame, "霊能者"),
       ),
-      ...chunkedClaimFields("🛡️ 騎士CO", guardClaimRows(visibleGame)),
+      ...chunkedClaimFields(
+        "📣 その他の役職CO",
+        roleDeclarationRows(visibleGame),
+      ),
     )
     .setColor(COLORS.day)
     .setFooter({ text: "● 人狼判定　○ 人間判定（各欄は直近30件）" });
@@ -2626,9 +2662,20 @@ function activeHumanPlayer(
   );
 }
 
-function claimedRoleFromToken(token: string): "占い師" | "霊能者" | undefined {
+type ResultClaimRole = "占い師" | "霊能者";
+
+function isResultClaimRole(role: ClaimedRole): role is ResultClaimRole {
+  return role === "占い師" || role === "霊能者";
+}
+
+function claimedRoleFromToken(token: string): ClaimedRole | undefined {
   if (token === "seer") return "占い師";
   if (token === "medium") return "霊能者";
+  if (token === "guard") return "騎士";
+  const roleIndex = /^role-(\d+)$/.exec(token)?.[1];
+  const role =
+    roleIndex === undefined ? undefined : ROLE_NAMES[Number(roleIndex)];
+  if (role && ROLE_NAMES.includes(role)) return role;
   return undefined;
 }
 
@@ -2753,12 +2800,14 @@ function quickResultClaimButton(
   );
 }
 
-function quickGuardClaimButton(game: GameState) {
+function quickRoleDeclarationButton(game: GameState, role: RoleName) {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
-      .setCustomId(componentId("claim-quick-guard", game))
-      .setLabel("騎士COする")
-      .setEmoji("🛡️")
+      .setCustomId(
+        componentId(`claim-quick-role-${ROLE_NAMES.indexOf(role)}`, game),
+      )
+      .setLabel(`${role}COする`)
+      .setEmoji(ROLE_INFO[role].icon)
       .setStyle(ButtonStyle.Primary),
   );
 }
@@ -2802,47 +2851,51 @@ function resultDayLabel(claimedRole: "占い師" | "霊能者", day: number) {
     : `${day}日目の処刑結果`;
 }
 
-function claimRoleRow(game: GameState, lockedRole?: ClaimedRole) {
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(componentId("claim-role", game))
-    .setPlaceholder(
-      lockedRole ? `${lockedRole}COを続ける` : "COする役職を選ぶ",
-    );
-  const options = [
+function roleClaimToken(role: RoleName): string {
+  if (role === "占い師") return "seer";
+  if (role === "霊能者") return "medium";
+  if (role === "騎士") return "guard";
+  return `role-${ROLE_NAMES.indexOf(role)}`;
+}
+
+export function claimRoleRows(
+  game: GameState,
+  lockedRole?: ClaimedRole,
+): Array<ActionRowBuilder<StringSelectMenuBuilder>> {
+  const roles = lockedRole ? [lockedRole] : ROLE_NAMES;
+  const groups = [
     {
-      role: "占い師" as const,
-      option: {
-        label: "占い師CO",
-        value: "seer",
-        emoji: "🔮",
-        description: "占い結果を公開する",
-      },
+      id: "village",
+      placeholder: "村人陣営からCO役職を選ぶ",
+      roles: roles.filter((role) => ROLE_INFO[role].team === "villager"),
     },
     {
-      role: "霊能者" as const,
-      option: {
-        label: "霊能者CO",
-        value: "medium",
-        emoji: "👻",
-        description: "前日に処刑された人の結果を公開する",
-      },
-    },
-    {
-      role: "騎士" as const,
-      option: {
-        label: "騎士CO",
-        value: "guard",
-        emoji: "🛡️",
-        description: "騎士だと公開する",
-      },
+      id: "other",
+      placeholder: "人狼・第三陣営からCO役職を選ぶ",
+      roles: roles.filter((role) => ROLE_INFO[role].team !== "villager"),
     },
   ];
-  menu.addOptions(
-    options
-      .filter(({ role }) => !lockedRole || role === lockedRole)
-      .map(({ option }) => option),
-  );
-  return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
+  return groups.flatMap((group) => {
+    if (group.roles.length === 0) return [];
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId(componentId(`claim-role-${group.id}`, game))
+      .setPlaceholder(
+        lockedRole ? `${lockedRole}COを続ける` : group.placeholder,
+      )
+      .addOptions(
+        group.roles.map((role) => ({
+          label: `${role}CO`,
+          value: roleClaimToken(role),
+          emoji: ROLE_INFO[role].icon,
+          description: isResultClaimRole(role)
+            ? `${role}の判定結果を公開する`
+            : `${role}だと公開する`,
+        })),
+      );
+    return [
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu),
+    ];
+  });
 }
 
 function customClaimTargetPanel(
@@ -2916,23 +2969,27 @@ export function claimPanel(game: GameState, claimant: Player): PhasePayload {
   const lockedRole = claimedRoleForPlayer(game, claimant.id);
   const seerResults = availableTrueSeerClaims(game, claimant);
   const mediumResults = availableTrueMediumClaims(game, claimant);
-  const canQuickGuard = claimant.role === "騎士" && lockedRole === undefined;
+  const canQuickDeclare =
+    claimant.role !== undefined &&
+    !isResultClaimRole(claimant.role) &&
+    lockedRole === undefined;
   const canChooseDetails =
     !lockedRole ||
-    (lockedRole !== "騎士" &&
+    (isResultClaimRole(lockedRole) &&
       remainingClaimSlots(game, claimant.id, lockedRole) > 0);
   const components: PhaseRow[] = [];
   const hasQuickResult = seerResults.length > 0 || mediumResults.length > 0;
-  const hasQuickClaim = hasQuickResult || canQuickGuard;
+  const hasQuickClaim = hasQuickResult || canQuickDeclare;
 
   if (seerResults.length > 0)
     components.push(quickResultClaimButton(game, "占い師"));
   if (mediumResults.length > 0)
     components.push(quickResultClaimButton(game, "霊能者"));
-  if (canQuickGuard) components.push(quickGuardClaimButton(game));
+  if (canQuickDeclare && claimant.role)
+    components.push(quickRoleDeclarationButton(game, claimant.role));
   if (canChooseDetails) {
     if (hasQuickClaim) components.push(customClaimButton(game));
-    else if (!lockedRole) components.push(claimRoleRow(game));
+    else if (!lockedRole) components.push(...claimRoleRows(game));
     else
       components.push(
         ...customClaimTargetPanel(game, claimant, lockedRole).components,
@@ -2947,8 +3004,8 @@ export function claimPanel(game: GameState, claimant: Player): PhasePayload {
       `**公開する${seerResults.length > 0 ? "占い" : "霊能"}結果**`,
       trueResultClaimSummary(trueResults),
     );
-  } else if (canQuickGuard) {
-    lines.push("**騎士COしますか？**");
+  } else if (canQuickDeclare && claimant.role) {
+    lines.push(`**${claimant.role}COしますか？**`);
   } else if (!lockedRole) {
     lines.push("**COする役職を選んでください。**");
   } else if (canChooseDetails) {
@@ -2957,7 +3014,12 @@ export function claimPanel(game: GameState, claimant: Player): PhasePayload {
       "判定する相手を選んでください。",
     );
   } else {
-    lines.push(`**${lockedRole}CO済み**`, "現在公開できる結果はありません。");
+    lines.push(
+      `**${lockedRole}CO済み**`,
+      isResultClaimRole(lockedRole)
+        ? "現在公開できる結果はありません。"
+        : "変更する場合は、いったんCOを取り消してください。",
+    );
   }
   if (hasConflictingSeerClaim(game, claimant.id))
     lines.push("\n⚠️ 本当の占い結果へ戻すには、現在のCOを取り消してください。");
@@ -3038,34 +3100,38 @@ async function handleQuickResultClaim(
   await sendDiscussionMessage(game, claimant, publishedLines.join("\n"));
 }
 
-async function handleQuickGuardClaim(
+async function handleQuickRoleDeclaration(
   interaction: ButtonInteraction,
   game: GameState,
   day: number,
+  roleIndex: number,
 ): Promise<void> {
   const claimant = activeHumanPlayer(game, interaction.user.id);
+  const role = ROLE_NAMES[roleIndex];
   if (
     game.phase !== "day" ||
     day !== game.day ||
     !claimant ||
-    claimant.role !== "騎士" ||
+    !role ||
+    isResultClaimRole(role) ||
+    claimant.role !== role ||
     claimedRoleForPlayer(game, claimant.id) !== undefined
   ) {
     await interaction.reply({
-      content: "現在は騎士COを公開できません。",
+      content: "現在はその役職COを公開できません。",
       ephemeral: true,
     });
     return;
   }
-  recordGuardDeclaration(game, claimant);
+  recordRoleDeclaration(game, claimant, role);
   await interaction.update({
-    content: "騎士COを公開しました。",
+    content: `${role}COを公開しました。`,
     components: [],
   });
   await sendDiscussionMessage(
     game,
     claimant,
-    roleDeclarationLine(claimant, "騎士"),
+    roleDeclarationLine(claimant, role),
   );
 }
 
@@ -3080,7 +3146,7 @@ async function handleCustomClaimOpen(
     : undefined;
   const canChooseDetails =
     !lockedRole ||
-    (lockedRole !== "騎士" &&
+    (isResultClaimRole(lockedRole) &&
       claimant !== undefined &&
       remainingClaimSlots(game, claimant.id, lockedRole) > 0);
   if (
@@ -3103,7 +3169,7 @@ async function handleCustomClaimOpen(
   }
   await interaction.update({
     content: "**別の内容でCO**\n名乗る役職を選んでください。",
-    components: [claimRoleRow(game)],
+    components: claimRoleRows(game),
   });
 }
 
@@ -3156,7 +3222,7 @@ async function handleClaimRetractionPrompt(
     return;
   }
   await interaction.update({
-    content: `**${claimedRole}COを取り消しますか？**\n公開済みの判定もすべて無効になります。取り消したことは${game.divisionGroups?.has(claimant.id) ? "同じ分断部屋" : "全員"}に通知されます。`,
+    content: `**${claimedRole}COを取り消しますか？**\n${isResultClaimRole(claimedRole) ? "公開済みの判定もすべて無効になります。" : "取り消すと、別の役職でCOし直せます。"}取り消したことは${game.divisionGroups?.has(claimant.id) ? "同じ分断部屋" : "全員"}に通知されます。`,
     components: [claimRetractionConfirmRow(game)],
   });
 }
@@ -3209,8 +3275,7 @@ async function handleClaimRole(
 ): Promise<void> {
   const claimant = activeHumanPlayer(game, interaction.user.id);
   const roleToken = interaction.values[0];
-  const requestedRole: ClaimedRole | undefined =
-    roleToken === "guard" ? "騎士" : claimedRoleFromToken(roleToken);
+  const requestedRole = claimedRoleFromToken(roleToken);
   if (game.phase !== "day" || day !== game.day || !claimant || !requestedRole) {
     await interaction.reply({
       content: "現在は役職COできません。",
@@ -3226,20 +3291,20 @@ async function handleClaimRole(
     });
     return;
   }
-  if (requestedRole === "騎士") {
-    if (lockedRole === "騎士") {
+  if (!isResultClaimRole(requestedRole)) {
+    if (lockedRole === requestedRole) {
       await interaction.update({
-        content: "騎士COはすでに公開しています。",
+        content: `${requestedRole}COはすでに公開しています。`,
         components: [],
       });
       return;
     }
-    recordGuardDeclaration(game, claimant);
+    recordRoleDeclaration(game, claimant, requestedRole);
     await interaction.update({ content: "COを公開しました。", components: [] });
     await sendDiscussionMessage(
       game,
       claimant,
-      roleDeclarationLine(claimant, "騎士"),
+      roleDeclarationLine(claimant, requestedRole),
     );
     return;
   }
@@ -3265,7 +3330,9 @@ function parseClaimResultAction(
   if (!match) return undefined;
   const claimedRole = claimedRoleFromToken(match[1]);
   const resultDay = Number(match[2]);
-  return claimedRole && Number.isInteger(resultDay)
+  return claimedRole &&
+    isResultClaimRole(claimedRole) &&
+    Number.isInteger(resultDay)
     ? { roleToken: match[1], claimedRole, resultDay }
     : undefined;
 }
@@ -3581,6 +3648,19 @@ function scheduleNpcDiscussion(game: GameState, daySeconds: number): void {
             resultText,
             resultDay,
           ),
+        );
+        return;
+      }
+
+      const publicClaimRole = npcPublicRoleClaim(game, npc);
+      if (
+        publicClaimRole &&
+        recordRoleDeclaration(game, npc, publicClaimRole)
+      ) {
+        await sendDiscussionMessage(
+          game,
+          npc,
+          roleDeclarationLine(npc, publicClaimRole),
         );
         return;
       }
@@ -5114,6 +5194,34 @@ function strategicNightTarget(
   );
 }
 
+export function chooseNpcAssassinationTarget(
+  game: GameState,
+  assassin: Player,
+  targets: Player[],
+  random: () => number = Math.random,
+): Player | undefined {
+  if (game.day < 2 || targets.length === 0) return undefined;
+  const suspicion = npcDecisionSuspicion(game, assassin);
+  const strongestEvidence = Math.max(
+    0,
+    ...targets.map((target) => suspicion.get(target.id) ?? 0),
+  );
+  const personalityChance =
+    assassin.npcPersonality === "追及"
+      ? 0.38
+      : assassin.npcPersonality === "直感"
+        ? 0.34
+        : assassin.npcPersonality === "同調"
+          ? 0.3
+          : 0.2;
+  const lateGameBonus = game.day >= 3 ? 0.12 : 0;
+  const evidenceBonus = Math.min(0.3, strongestEvidence * 0.1);
+  if (random() >= personalityChance + lateGameBonus + evidenceBonus)
+    return undefined;
+  const targetId = chooseNpcVoteTarget(assassin, targets, suspicion, random);
+  return targets.find((target) => target.id === targetId);
+}
+
 function setNpcNightChoices(game: GameState): void {
   const living = alivePlayers(game);
   const wolfTargets = living.filter((player) => !isActualWolfRole(player.role));
@@ -5140,10 +5248,10 @@ function setNpcNightChoices(game: GameState): void {
         game.nightChoices.set(nightActionKey("guard", npc.id), target.id);
     } else if (action === "assassinate") {
       const targets = nightTargets(game, npc, action);
-      const shouldUse = game.day >= 2 && Math.random() < 0.25;
+      const target = chooseNpcAssassinationTarget(game, npc, targets);
       game.nightChoices.set(
         nightActionKey(action, npc.id),
-        shouldUse && targets.length ? randomItem(targets).id : "skip",
+        target?.id ?? "skip",
       );
     } else if (action === "divide") {
       const targets = nightTargets(game, npc, action);
@@ -5841,8 +5949,8 @@ function claimRecapLines(game: GameState, day: number): string[] {
       if (event.action === "retract")
         return `↩️ **${speakerName}**｜${event.claimedRole}COを取り消し`;
       const actualRole = speaker?.role ?? "不明";
-      if (event.claimedRole === "騎士")
-        return `🛡️ **${speakerName}**｜騎士CO（実際：${actualRole}）`;
+      if (!isResultClaimRole(event.claimedRole))
+        return `${ROLE_INFO[event.claimedRole].icon} **${speakerName}**｜${event.claimedRole}CO（実際：${actualRole}）`;
       const target = event.targetId
         ? recapPlayer(game, event.targetId)
         : undefined;
@@ -6673,8 +6781,13 @@ export async function handleComponent(
         Number(dayText),
         "霊能者",
       );
-    else if (action === "claim-quick-guard")
-      await handleQuickGuardClaim(interaction, game, Number(dayText));
+    else if (action.startsWith("claim-quick-role-"))
+      await handleQuickRoleDeclaration(
+        interaction,
+        game,
+        Number(dayText),
+        Number(action.slice("claim-quick-role-".length)),
+      );
     else if (action === "claim-custom-open")
       await handleCustomClaimOpen(interaction, game, Number(dayText));
     else if (action === "claim-retract")
@@ -6724,7 +6837,7 @@ export async function handleComponent(
     await handlePlayerCountChange(interaction, game);
   else if (action === "role-config-select")
     await handleRoleConfigSelect(interaction, game);
-  else if (action === "claim-role")
+  else if (action.startsWith("claim-role-"))
     await handleClaimRole(interaction, game, day);
   else if (action.startsWith("claim-target-"))
     await handleClaimTarget(interaction, game, day, action);

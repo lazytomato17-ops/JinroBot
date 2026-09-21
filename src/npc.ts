@@ -10,7 +10,7 @@ import type {
   RoleName,
   VoteRecord,
 } from "./types";
-import { isActualWolfRole, isWolfTeamRole } from "./roles";
+import { isActualWolfRole, isWolfTeamRole, ROLE_INFO } from "./roles";
 
 export const NPC_PERSONALITIES: NpcPersonality[] = [
   "慎重",
@@ -60,11 +60,7 @@ export function planNpcSeerClaims(
       )
       .map((player) => [
         player.id,
-        chooseNpcSeerClaimPlan(
-          player.role as RoleName,
-          wolfCount,
-          random,
-        ),
+        chooseNpcSeerClaimPlan(player.role as RoleName, wolfCount, random),
       ]),
   );
 }
@@ -86,6 +82,7 @@ const OWN_WHITE_CLAIM_PENALTY = -8;
 const MAX_SHARED_ARGUMENT_SCORE = 4;
 const MAX_SHARED_SUSPICION = 2.5;
 const DISPROVED_BLACK_CLAIM_SCORE = 1;
+const LONE_DAY_ONE_SEER_PROTECTION = 2.5;
 
 export const HUMAN_ARGUMENT_REASONS: HumanArgumentReason[] = [
   "black-result",
@@ -228,6 +225,28 @@ function logicallyDisprovedSeerIds(game: HumanArgumentContext): Set<string> {
     }
   }
   return disproved;
+}
+
+export function credibleLoneDayOneSeerId(
+  game: HumanArgumentContext & Pick<GameState, "humanSuspicions">,
+): string | undefined {
+  if (game.day !== 1 || game.roleConfig.占い師 < 1) return undefined;
+  const claimantIds = roleClaimantIds(game.npcClaims, "占い師");
+  if (claimantIds.size !== 1 || isRoleClaimOverCapacity(game, "占い師"))
+    return undefined;
+  const claimantId = [...claimantIds][0];
+  const claimant = game.players.find((player) => player.id === claimantId);
+  if (!claimant?.alive) return undefined;
+  if (logicallyDisprovedSeerIds(game).has(claimantId)) return undefined;
+  if (conflictingSeerClaimantIds(game.npcClaims).has(claimantId))
+    return undefined;
+  const hasSupportedContradiction = [...game.humanSuspicions.values()].some(
+    (argument) =>
+      argument.targetId === claimantId &&
+      argument.reason !== "intuition" &&
+      isHumanArgumentSupported(game, argument),
+  );
+  return hasSupportedContradiction ? undefined : claimantId;
 }
 
 function hasClaimVoteContradiction(
@@ -458,6 +477,18 @@ export function npcDecisionSuspicion(
     npc.npcPersonality ?? "慎重",
   );
 
+  const loneSeerId = credibleLoneDayOneSeerId(game);
+  if (
+    loneSeerId &&
+    npc.role !== undefined &&
+    ROLE_INFO[npc.role].team === "villager"
+  ) {
+    result.set(
+      loneSeerId,
+      (result.get(loneSeerId) ?? 0) - LONE_DAY_ONE_SEER_PROTECTION,
+    );
+  }
+
   const ownResults = latestSeerResults(game.npcClaims, npc.id);
   const ownBlackIds = new Set<string>();
   const ownWhiteIds = new Set<string>();
@@ -508,9 +539,7 @@ export function npcDecisionSuspicion(
 export function chooseStrategicNightTarget(
   action: "kill" | "guard",
   targets: Player[],
-  claimedRoleFor: (
-    playerId: string,
-  ) => "占い師" | "霊能者" | "騎士" | undefined,
+  claimedRoleFor: (playerId: string) => RoleName | undefined,
   random: () => number = Math.random,
 ): Player | undefined {
   return [...targets]
@@ -777,6 +806,14 @@ export function chooseNpcQuestionAnswer(
     concernedClaimants.add(claimantId);
   for (const claimantId of concernedClaimants)
     addQuestionScore(scores, claimantId, 0.3);
+
+  const loneSeerId = credibleLoneDayOneSeerId(game);
+  if (
+    loneSeerId &&
+    npc.role !== undefined &&
+    ROLE_INFO[npc.role].team === "villager"
+  )
+    addQuestionScore(scores, loneSeerId, -LONE_DAY_ONE_SEER_PROTECTION);
 
   // 狂人は人狼を知らない。日によって公開情報への逆張りで場を乱す。
   const madmanDistorts =
