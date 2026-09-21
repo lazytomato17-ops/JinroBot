@@ -3,9 +3,13 @@ import {
   buildCustomRoles,
   buildRoles,
   getWinner,
+  LEGACY_ROLE_NAMES,
+  ROLE_INFO,
   roleConfigFromRoles,
+  seerResultForRole,
   usesUnrestrictedRoleConfig,
 } from "./roles";
+import type { RoleConfig } from "./types";
 
 describe("buildRoles", () => {
   it("4人村は人狼1・占い師1・村人2になる", () => {
@@ -68,6 +72,57 @@ describe("getWinner", () => {
         { role: "村人", alive: true },
       ]),
     ).toBe("villager");
+  });
+
+  it("饒舌な人狼を実際の人狼として数える", () => {
+    expect(
+      getWinner([
+        { role: "饒舌な人狼", alive: true },
+        { role: "村人", alive: true },
+      ]),
+    ).toBe("wolf");
+  });
+
+  it("通常決着時に生存妖狐、恋人の順で勝利を横取りする", () => {
+    const players = [
+      { id: "wolf", role: "人狼" as const, alive: false },
+      { id: "fox", role: "妖狐" as const, alive: true },
+      { id: "a", role: "村人" as const, alive: true },
+      { id: "b", role: "狂人" as const, alive: true },
+    ];
+    expect(getWinner(players)).toBe("fox");
+    expect(getWinner(players, { loverPairs: [["a", "b"]] })).toBe(
+      "lovers",
+    );
+  });
+});
+
+describe("旧版の実プレイ20役職", () => {
+  it("20役職を過不足なく登録している", () => {
+    expect(LEGACY_ROLE_NAMES).toHaveLength(20);
+    expect(new Set(LEGACY_ROLE_NAMES).size).toBe(20);
+    for (const role of LEGACY_ROLE_NAMES) expect(ROLE_INFO[role]).toBeDefined();
+    expect(LEGACY_ROLE_NAMES).toContain("てるてる");
+    expect(LEGACY_ROLE_NAMES).not.toContain("テルテル" as never);
+  });
+
+  it("20役職をそれぞれカスタム配役へ入れられる", () => {
+    for (const role of LEGACY_ROLE_NAMES) {
+      const counts = { 人狼: 1, [role]: role === "共有者" ? 2 : 1 } as Partial<
+        Omit<RoleConfig, "村人">
+      > &
+        Pick<RoleConfig, "人狼">;
+      const roles = buildCustomRoles(7, counts);
+      expect(roles.filter((candidate) => candidate === role)).toHaveLength(
+        role === "共有者" ? 2 : 1,
+      );
+    }
+  });
+
+  it("狼憑きと饒舌な人狼は人狼判定になる", () => {
+    expect(seerResultForRole("狼憑き")).toBe("人狼");
+    expect(seerResultForRole("饒舌な人狼")).toBe("人狼");
+    expect(seerResultForRole("狂信者")).toBe("人間");
   });
 });
 

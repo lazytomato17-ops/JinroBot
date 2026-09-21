@@ -1,5 +1,6 @@
 import {
   ChannelType,
+  PermissionFlagsBits,
   type ButtonInteraction,
   type Guild,
   type InteractionReplyOptions,
@@ -73,6 +74,16 @@ describe("初回ガイド", () => {
       label: "Botを追加",
       url: BOT_INVITE_URL,
     });
+
+    const permissions = BigInt(
+      new URL(BOT_INVITE_URL).searchParams.get("permissions") ?? "0",
+    );
+    expect(permissions & PermissionFlagsBits.ManageChannels).toBe(
+      PermissionFlagsBits.ManageChannels,
+    );
+    expect(permissions & PermissionFlagsBits.CreateEvents).toBe(
+      PermissionFlagsBits.CreateEvents,
+    );
   });
 
   it("新規サーバーでは1クリック試遊と再確認の方法を案内する", () => {
@@ -135,7 +146,9 @@ describe("初回ガイド", () => {
   it("募集メッセージを取得できない場合は二重エラーにせず募集を破棄する", async () => {
     const channelId = "failed-quick-start-channel";
     const editedReplies: InteractionReplyOptions[] = [];
-    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
     const interaction = {
       inGuild: () => true,
       channelId,
@@ -171,7 +184,9 @@ describe("初回ガイド", () => {
     const channelId = "phase-panel-failure-channel";
     const replies: InteractionReplyOptions[] = [];
     const lobbyEdits: InteractionReplyOptions[] = [];
-    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
     const user = {
       id: "phase-panel-failure-user",
       displayName: "進行確認者",
@@ -214,8 +229,9 @@ describe("初回ガイド", () => {
             typeof component.custom_id === "string" &&
             component.custom_id.includes(":start:"),
         );
-      expect(startId && "custom_id" in startId ? startId.custom_id : undefined)
-        .toBeTypeOf("string");
+      expect(
+        startId && "custom_id" in startId ? startId.custom_id : undefined,
+      ).toBeTypeOf("string");
 
       const startInteraction = {
         customId:

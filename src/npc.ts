@@ -7,8 +7,10 @@ import type {
   Player,
   PublicResult,
   RoleClaim,
+  RoleName,
   VoteRecord,
 } from "./types";
+import { isActualWolfRole, isWolfTeamRole } from "./roles";
 
 export const NPC_PERSONALITIES: NpcPersonality[] = [
   "慎重",
@@ -20,13 +22,20 @@ export const NPC_PERSONALITIES: NpcPersonality[] = [
 export const MADMAN_WHITE_CLAIM_CHANCE = 0.45;
 
 export function chooseNpcSeerClaimPlan(
-  role: "人狼" | "狂人",
+  role: RoleName,
   wolfCount: number,
   random: () => number = Math.random,
 ): NpcSeerClaimPlan {
   const roll = random();
-  const day1Chance = role === "狂人" ? 0.45 : wolfCount === 1 ? 0.3 : 0.2;
-  const day2Chance = role === "狂人" ? 0.25 : 0.1;
+  const day1Chance =
+    role === "てるてる"
+      ? 0.7
+      : role === "狂人"
+        ? 0.45
+        : wolfCount === 1
+          ? 0.3
+          : 0.2;
+  const day2Chance = role === "てるてる" ? 0.2 : role === "狂人" ? 0.25 : 0.1;
   if (roll < day1Chance) return "day1";
   if (roll < day1Chance + day2Chance) return "day2";
   return "never";
@@ -39,17 +48,20 @@ export function planNpcSeerClaims(
   const seerCount = players.filter((player) => player.role === "占い師").length;
   if (seerCount === 0) return new Map();
 
-  const wolfCount = players.filter((player) => player.role === "人狼").length;
+  const wolfCount = players.filter((player) =>
+    isActualWolfRole(player.role),
+  ).length;
   return new Map(
     players
       .filter(
         (player) =>
-          player.isNpc && (player.role === "人狼" || player.role === "狂人"),
+          player.isNpc &&
+          (isWolfTeamRole(player.role) || player.role === "てるてる"),
       )
       .map((player) => [
         player.id,
         chooseNpcSeerClaimPlan(
-          player.role as "人狼" | "狂人",
+          player.role as RoleName,
           wolfCount,
           random,
         ),
@@ -686,8 +698,15 @@ export function chooseNpcQuestionAnswer(
   let candidates = game.players.filter(
     (player) => player.alive && player.id !== npc.id,
   );
-  if (npc.role === "人狼") {
-    const nonWolves = candidates.filter((player) => player.role !== "人狼");
+  if (
+    isActualWolfRole(npc.role) ||
+    npc.role === "狂信者" ||
+    npc.role === "妖術師" ||
+    npc.role === "分断者"
+  ) {
+    const nonWolves = candidates.filter(
+      (player) => !isActualWolfRole(player.role),
+    );
     if (nonWolves.length > 0) candidates = nonWolves;
   }
   if (candidates.length === 0) return null;

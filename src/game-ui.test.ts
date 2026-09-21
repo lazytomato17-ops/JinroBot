@@ -12,7 +12,11 @@ import {
   claimedRoleForPlayer,
   claimListEmbed,
   claimPanel,
+  completeLoquaciousMissionForMessage,
   dayEmbed,
+  divisionGroupsForPlayers,
+  divisionRecoverySnapshotFromTopic,
+  eliminateWithLovers,
   finishedDayEmbed,
   fillMissingNightAction,
   feedbackReasonRows,
@@ -28,6 +32,7 @@ import {
   lobbyPayload,
   mediumResultRecipients,
   nightEmbed,
+  nightActionForPlayer,
   nextNpcSeerTarget,
   npcDecisionSuspicion,
   npcDiscussionSpeakers,
@@ -59,6 +64,7 @@ import {
   voteBallotFields,
   voteEmbed,
   voteTallyRows,
+  weightedVoteTargetIds,
   usesUnrankedRoleConfig,
   wolfChatButtonRow,
   wolfChatRelayPayload,
@@ -281,7 +287,8 @@ describe("ゲーム画面", () => {
     expect(componentJson).toContain("player-count");
     expect(componentJson).not.toContain("プリセット");
     expect(payload.embeds[0].toJSON().description).not.toContain("｜");
-    const playerCountId = payload.components[0].toJSON().components[0].custom_id;
+    const playerCountId =
+      payload.components[0].toJSON().components[0].custom_id;
     const parsed = parseGameComponentId(playerCountId ?? "");
     expect(parsed).toMatchObject({
       action: "player-count",
@@ -384,30 +391,32 @@ describe("ゲーム画面", () => {
     expect(game.roleConfig.狂人).toBe(1);
   });
 
-  it("配役設定はフォームではなく増減ボタンを使う", () => {
+  it("配役設定は役職選択と増減ボタンを使う", () => {
     const game = makeGame();
     game.phase = "lobby";
     const payload = roleConfigPanel(game);
     expect(payload.embeds[0].toJSON().title).toBe("配役設定｜4人");
-    expect(payload.components).toHaveLength(5);
+    expect(payload.components).toHaveLength(2);
     const componentJson = JSON.stringify(
       payload.components.map((row) => row.toJSON()),
     );
     expect(componentJson).toContain("人狼 1人");
-    expect(componentJson).toContain("狂人 0人");
+    expect(componentJson).toContain("変更する役職を選ぶ");
+    expect(componentJson).toContain("狂人");
     expect(componentJson).toContain("role-increase");
     expect(componentJson).not.toContain("role-config-submit");
-    expect(payload.components[2].toJSON().components[2].disabled).toBe(true);
-    expect(payload.components[3].toJSON().components[2].disabled).toBe(false);
+    expect(payload.components[1].toJSON().components[2].disabled).toBe(true);
     expect(payload.embeds[0].toJSON().fields?.[0].value).toContain(
       "村人 **1**",
     );
 
     const betaGame = makeGame();
     betaGame.phase = "lobby";
+    betaGame.targetPlayerCount = 5;
     enableBetaHost(betaGame);
     expect(
-      roleConfigPanel(betaGame).components[2].toJSON().components[2].disabled,
+      roleConfigPanel(betaGame, "占い師").components[1].toJSON().components[2]
+        .disabled,
     ).toBe(false);
     expect(roleConfigPanel(betaGame).embeds[0].toJSON().description).toContain(
       "各役職の個別上限はありません",
@@ -425,16 +434,16 @@ describe("ゲーム画面", () => {
     oneWolfGame.phase = "lobby";
     enableBetaHost(oneWolfGame);
     expect(
-      roleConfigPanel(oneWolfGame).components[2].toJSON().components[2]
-        .disabled,
+      roleConfigPanel(oneWolfGame, "占い師").components[1].toJSON()
+        .components[2].disabled,
     ).toBe(false);
 
     const twoWolfGame = makeGame(["人狼", "人狼", "占い師", "村人", "村人"]);
     twoWolfGame.phase = "lobby";
     enableBetaHost(twoWolfGame);
     expect(
-      roleConfigPanel(twoWolfGame).components[2].toJSON().components[2]
-        .disabled,
+      roleConfigPanel(twoWolfGame, "占い師").components[1].toJSON()
+        .components[2].disabled,
     ).toBe(false);
 
     const twoSeerGame = makeGame([
@@ -448,8 +457,8 @@ describe("ゲーム画面", () => {
     twoSeerGame.phase = "lobby";
     enableBetaHost(twoSeerGame);
     expect(
-      roleConfigPanel(twoSeerGame).components[2].toJSON().components[2]
-        .disabled,
+      roleConfigPanel(twoSeerGame, "占い師").components[1].toJSON()
+        .components[2].disabled,
     ).toBe(false);
 
     const threeWolfGame = makeGame([
@@ -464,8 +473,8 @@ describe("ゲーム画面", () => {
     threeWolfGame.phase = "lobby";
     enableBetaHost(threeWolfGame);
     expect(
-      roleConfigPanel(threeWolfGame).components[2].toJSON().components[2]
-        .disabled,
+      roleConfigPanel(threeWolfGame, "占い師").components[1].toJSON()
+        .components[2].disabled,
     ).toBe(false);
 
     const maximumSeerGame = makeGame([
@@ -480,8 +489,8 @@ describe("ゲーム画面", () => {
     maximumSeerGame.phase = "lobby";
     enableBetaHost(maximumSeerGame);
     expect(
-      roleConfigPanel(maximumSeerGame).components[2].toJSON().components[2]
-        .disabled,
+      roleConfigPanel(maximumSeerGame, "占い師").components[1].toJSON()
+        .components[2].disabled,
     ).toBe(false);
 
     const oneMadmanGame = makeGame([
@@ -496,8 +505,8 @@ describe("ゲーム画面", () => {
     oneMadmanGame.phase = "lobby";
     enableBetaHost(oneMadmanGame);
     expect(
-      roleConfigPanel(oneMadmanGame).components[1].toJSON().components[2]
-        .disabled,
+      roleConfigPanel(oneMadmanGame, "狂人").components[1].toJSON()
+        .components[2].disabled,
     ).toBe(false);
 
     const maximumMadmanGame = makeGame([
@@ -512,8 +521,8 @@ describe("ゲーム画面", () => {
     maximumMadmanGame.phase = "lobby";
     enableBetaHost(maximumMadmanGame);
     expect(
-      roleConfigPanel(maximumMadmanGame).components[1].toJSON().components[2]
-        .disabled,
+      roleConfigPanel(maximumMadmanGame, "狂人").components[1].toJSON()
+        .components[2].disabled,
     ).toBe(false);
 
     const maximumGuardGame = makeGame([
@@ -526,13 +535,13 @@ describe("ゲーム画面", () => {
     ]);
     maximumGuardGame.phase = "lobby";
     expect(
-      roleConfigPanel(maximumGuardGame).components[3].toJSON().components[2]
-        .disabled,
+      roleConfigPanel(maximumGuardGame, "騎士").components[1].toJSON()
+        .components[2].disabled,
     ).toBe(true);
     enableBetaHost(maximumGuardGame);
     expect(
-      roleConfigPanel(maximumGuardGame).components[3].toJSON().components[2]
-        .disabled,
+      roleConfigPanel(maximumGuardGame, "騎士").components[1].toJSON()
+        .components[2].disabled,
     ).toBe(false);
 
     const maximumMediumGame = makeGame([
@@ -545,13 +554,13 @@ describe("ゲーム画面", () => {
     ]);
     maximumMediumGame.phase = "lobby";
     expect(
-      roleConfigPanel(maximumMediumGame).components[4].toJSON().components[2]
-        .disabled,
+      roleConfigPanel(maximumMediumGame, "霊能者").components[1].toJSON()
+        .components[2].disabled,
     ).toBe(true);
     enableBetaHost(maximumMediumGame);
     expect(
-      roleConfigPanel(maximumMediumGame).components[4].toJSON().components[2]
-        .disabled,
+      roleConfigPanel(maximumMediumGame, "霊能者").components[1].toJSON()
+        .components[2].disabled,
     ).toBe(false);
   });
 
@@ -572,7 +581,7 @@ describe("ゲーム画面", () => {
     game.phase = "lobby";
     enableBetaHost(game);
     const panel = roleConfigPanel(game).embeds[0].toJSON();
-    expect(panel.fields).toHaveLength(1);
+    expect(panel.fields).toHaveLength(2);
     expect(JSON.stringify(panel)).not.toContain("⚠️");
     expect(usesUnrankedRoleConfig(game)).toBe(true);
 
@@ -1539,6 +1548,159 @@ describe("ゲーム画面", () => {
     expect(game.npcMemory.get("2")?.get("1")).toBeCloseTo(0.9);
   });
 
+  it("分断中の議論画面には同じ部屋の参加者だけを表示する", () => {
+    const game = makeGame(["分断者", "人狼", "占い師", "村人"]);
+    game.divisionGroups = new Map([
+      ["0", "A"],
+      ["1", "A"],
+      ["2", "B"],
+      ["3", "B"],
+    ]);
+
+    const json = dayEmbed(game, "A").toJSON();
+    expect(json.fields?.[0].name).toBe("A組（2人）");
+    expect(json.fields?.[0].value).toContain("プレイヤー1");
+    expect(json.fields?.[0].value).not.toContain("プレイヤー2");
+  });
+
+  it("分断者と指定相手を同じ部屋に置き、人数を均等に分ける", () => {
+    const game = makeGame(["分断者", "人狼", "占い師", "騎士", "村人"]);
+    const groups = divisionGroupsForPlayers(game.players, "0", "3");
+
+    expect(groups.get("0")).toBe(groups.get("3"));
+    expect([...groups.values()].filter((group) => group === "A")).toHaveLength(
+      3,
+    );
+    expect([...groups.values()].filter((group) => group === "B")).toHaveLength(
+      2,
+    );
+  });
+
+  it("再起動後に分断前のチャンネル権限を復旧できる情報を解析する", () => {
+    const snapshot = divisionRecoverySnapshotFromTopic(
+      "jinrobot-division:v1:123456789012345678:123456789012345678.d,234567890123456789.i,345678901234567890.a",
+    );
+
+    expect(snapshot?.mainChannelId).toBe("123456789012345678");
+    expect([...(snapshot?.permissions.entries() ?? [])]).toEqual([
+      ["123456789012345678", "deny"],
+      ["234567890123456789", "inherit"],
+      ["345678901234567890", "allow"],
+    ]);
+    expect(divisionRecoverySnapshotFromTopic("unrelated")).toBeUndefined();
+  });
+
+  it("市長の投票を2票として集計する", () => {
+    const game = makeGame(["市長", "人狼", "占い師", "村人"]);
+    game.votes.set("0", "1");
+    game.votes.set("1", "0");
+    expect(weightedVoteTargetIds(game)).toEqual(["1", "1", "0"]);
+    expect(voteTallyRows(game)).toContain("プレイヤー1：2票");
+    expect(voteBallotFields(game)[0].value).toContain("（2票）");
+  });
+
+  it("追加役職の夜行動を役職と日数に応じて割り当てる", () => {
+    const always: Array<[RoleName, string]> = [
+      ["饒舌な人狼", "kill"],
+      ["逃亡者", "flee"],
+      ["暗殺者", "assassinate"],
+      ["妖術師", "sorcery"],
+      ["分断者", "divide"],
+    ];
+    for (const [role, action] of always) {
+      const game = makeGame([role, "人狼", "占い師", "村人"]);
+      expect(nightActionForPlayer(game, game.players[0])).toBe(action);
+    }
+
+    const firstNightRoles: Array<[RoleName, string]> = [
+      ["キューピッド", "cupid"],
+      ["純愛者", "devotee"],
+      ["怪盗", "thief"],
+    ];
+    for (const [role, action] of firstNightRoles) {
+      const game = makeGame([role, "人狼", "占い師", "村人"]);
+      expect(nightActionForPlayer(game, game.players[0])).toBe(action);
+      game.day = 2;
+      expect(nightActionForPlayer(game, game.players[0])).toBeUndefined();
+    }
+
+    const compassGame = makeGame(["方位磁針", "人狼", "占い師", "村人"]);
+    expect(
+      nightActionForPlayer(compassGame, compassGame.players[0]),
+    ).toBeUndefined();
+    compassGame.day = 2;
+    expect(nightActionForPlayer(compassGame, compassGame.players[0])).toBe(
+      "compass",
+    );
+  });
+
+  it("饒舌な人狼は実際の議論メッセージにお題を含めると達成する", () => {
+    const game = makeGame(["饒舌な人狼", "占い師", "騎士", "村人"]);
+    game.loquaciousMissions = new Map([["0", "投票"]]);
+    game.loquaciousCompleted = new Set();
+
+    expect(
+      completeLoquaciousMissionForMessage(
+        game,
+        "0",
+        game.channelId,
+        "占い結果を見よう",
+      ),
+    ).toBeUndefined();
+    expect(
+      completeLoquaciousMissionForMessage(
+        game,
+        "0",
+        game.channelId,
+        "今日は投票先を考えよう",
+      ),
+    ).toBe("投票");
+    expect(
+      completeLoquaciousMissionForMessage(game, "0", game.channelId, "投票"),
+    ).toBeUndefined();
+  });
+
+  it("分断中の饒舌ミッションは本人の分断部屋での発言だけを数える", () => {
+    const game = makeGame(["饒舌な人狼", "占い師", "騎士", "村人"]);
+    game.loquaciousMissions = new Map([["0", "理由"]]);
+    game.loquaciousCompleted = new Set();
+    game.divisionGroups = new Map([["0", "A"]]);
+    game.divisionChannels = new Map([["A", { id: "sector-a" } as TextChannel]]);
+
+    expect(
+      completeLoquaciousMissionForMessage(
+        game,
+        "0",
+        game.channelId,
+        "理由を話す",
+      ),
+    ).toBeUndefined();
+    expect(
+      completeLoquaciousMissionForMessage(game, "0", "sector-a", "理由を話す"),
+    ).toBe("理由");
+  });
+
+  it("恋人の片方が死亡するともう片方も道連れになる", () => {
+    const game = makeGame(["村人", "人狼", "占い師", "村人"]);
+    game.loverPairs = [["0", "2"]];
+    const deaths: Player[] = [];
+    eliminateWithLovers(game, game.players[0], deaths);
+    expect(deaths.map((player) => player.id)).toEqual(["0", "2"]);
+    expect(game.players[2].alive).toBe(false);
+  });
+
+  it("共有者と狂信者のDMには知っている仲間を表示する", () => {
+    const shared = makeGame(["共有者", "共有者", "人狼", "村人"]);
+    expect(
+      roleDmEmbed(shared, shared.players[0]).toJSON().description,
+    ).toContain("共有者の相方: プレイヤー1");
+
+    const fanatic = makeGame(["狂信者", "饒舌な人狼", "人狼", "村人"]);
+    const description = roleDmEmbed(fanatic, fanatic.players[0]).toJSON()
+      .description;
+    expect(description).toContain("人狼: プレイヤー1、プレイヤー2");
+  });
+
   it("人狼会議は生存中の人間の人狼だけを仲間として扱う", () => {
     const game = makeGame(["人狼", "人狼", "人狼", "村人"]);
     game.players[1].isNpc = false;
@@ -1557,7 +1719,9 @@ describe("ゲーム画面", () => {
     game.players[1].isNpc = false;
 
     const row = wolfChatButtonRow(game, game.players[0]);
-    expect(JSON.stringify(row?.toJSON())).toContain("tb:wolf-chat-open:channel:");
+    expect(JSON.stringify(row?.toJSON())).toContain(
+      "tb:wolf-chat-open:channel:",
+    );
     expect(JSON.stringify(row?.toJSON())).toContain(":2");
     game.players[1].isNpc = true;
     expect(wolfChatButtonRow(game, game.players[0])).toBeUndefined();
