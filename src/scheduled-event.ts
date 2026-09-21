@@ -8,7 +8,6 @@ import {
   EmbedBuilder,
   GuildScheduledEventEntityType,
   GuildScheduledEventPrivacyLevel,
-  GuildScheduledEventStatus,
   ModalBuilder,
   ModalSubmitInteraction,
   PermissionFlagsBits,
@@ -18,7 +17,6 @@ import {
   TextInputBuilder,
   TextInputStyle,
 } from "discord.js";
-import { createLobby } from "./game";
 
 const DEFAULT_TARGET_PLAYER_COUNT = 7;
 const MAX_PLAYER_COUNT = 15;
@@ -26,6 +24,7 @@ const EVENT_DURATION_MS = 2 * 60 * 60 * 1000;
 const RECRUIT_BUTTON_PREFIX = "tb-recruit:start:";
 const RECRUIT_SETUP_PREFIX = "tb-recruit:setup:";
 const RECRUIT_SETUP_TTL_MS = 30 * 60 * 1000;
+const RECRUIT_CREATE_COOLDOWN_MS = 5 * 60 * 1000;
 const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
 const DATE_OPTION_DAYS = 25;
 const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"] as const;
@@ -48,9 +47,11 @@ interface RecruitSetupSession {
   targetPlayerCount: number;
   startAt: Date;
   createdAt: number;
+  creating: boolean;
 }
 
 const recruitSetupSessions = new Map<string, RecruitSetupSession>();
+const recruitLastCreatedAt = new Map<string, number>();
 
 export const recruitCommand = new SlashCommandBuilder()
   .setName("recruit")
@@ -158,9 +159,7 @@ export function parseRecruitStartAt(
 ): RecruitStartAtParseResult {
   const dateText = normaliseInput(dateInput);
   const timeText = normaliseInput(timeInput);
-  const dateMatch = /^(?:(\d{4})[\/-])?(\d{1,2})[\/-](\d{1,2})$/.exec(
-    dateText,
-  );
+  const dateMatch = /^(?:(\d{4})[/-])?(\d{1,2})[/-](\d{1,2})$/.exec(dateText);
   const timeMatch = /^(\d{1,2}):(\d{2})$/.exec(timeText);
 
   if (!dateMatch) {
@@ -255,15 +254,22 @@ function newSetupSessionId(): string {
   return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function recruitHostKey(guildId: string, hostId: string): string {
+  return `${guildId}:${hostId}`;
+}
+
+function sweepExpiredSetupSessions(now = Date.now()): void {
+  for (const [sessionId, session] of recruitSetupSessions) {
+    if (now - session.createdAt > RECRUIT_SETUP_TTL_MS) {
+      recruitSetupSessions.delete(sessionId);
+    }
+  }
+}
+
 function getSetupSession(sessionId: string): RecruitSetupSession | undefined {
+  sweepExpiredSetupSessions();
   const session = recruitSetupSessions.get(sessionId);
   if (!session) return undefined;
-
-  if (Date.now() - session.createdAt > RECRUIT_SETUP_TTL_MS) {
-    recruitSetupSessions.delete(sessionId);
-    return undefined;
-  }
-
   return session;
 }
 
@@ -433,8 +439,8 @@ function recruitmentMessage(
         `開始：<t:${Math.floor(startAt.getTime() / 1000)}:F>（<t:${Math.floor(startAt.getTime() / 1000)}:R>）`,
         `予定人数：**${targetPlayerCount}人**`,
         "",
-        "参加する人はDiscordイベントを開いて **「興味あり」** を押してください。",
-        "開始時刻になったら、ホストが下のボタンを押すと参加表明したメンバーで人狼ロビーを作成します。",
+        "開始通知を受け取りたい人は、Discordイベントを開いて **「興味あり」** を押してください。",
+        "「興味あり」は通知登録です。開始後、ロビーの **「参加する」** を押すと参加が確定します。",
       ].join("\n"),
     )
     .setColor(0x5865f2)
@@ -491,15 +497,6 @@ export async function handleRecruitCommand(
     return;
   }
 
-  if (!interaction.memberPermissions?.has(PermissionFlagsBits.CreateEvents)) {
-    await interaction.reply({
-      content:
-        "Discordイベントを作成する権限がありません。サーバーで「イベントを作成」権限を付けてもらってください。",
-      ephemeral: true,
-    });
-    return;
-  }
-
   if (
     interaction.appPermissions &&
     (!interaction.appPermissions.has(PermissionFlagsBits.CreateEvents) ||
@@ -513,6 +510,45 @@ export async function handleRecruitCommand(
     return;
   }
 
+  const now = Date.now();
+  sweepExpiredSetupSessions(now);
+  const hostKey = recruitHostKey(interaction.guildId, interaction.user.id);
+  for (const [key, createdAt] of recruitLastCreatedAt) {
+    if (now - createdAt >= RECRUIT_CREATE_COOLDOWN_MS) {
+      recruitLastCreatedAt.delete(key);
+    }
+  }
+  const lastCreatedAt = recruitLastCreatedAt.get(hostKey);
+  if (
+    lastCreatedAt !== undefined &&
+    now - lastCreatedAt < RECRUIT_CREATE_COOLDOWN_MS
+  ) {
+    const retryAfterSeconds = Math.ceil(
+      (RECRUIT_CREATE_COOLDOWN_MS - (now - lastCreatedAt)) / 1000,
+    );
+    await interaction.reply({
+      content: `募集を作成した直後です。連続作成を防ぐため、あと${retryAfterSeconds}秒待ってください。`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  for (const [sessionId, existingSession] of recruitSetupSessions) {
+    if (
+      existingSession.guildId === interaction.guildId &&
+      existingSession.hostId === interaction.user.id
+    ) {
+      if (existingSession.creating) {
+        await interaction.reply({
+          content: "すでに募集を作成中です。そのままお待ちください。",
+          ephemeral: true,
+        });
+        return;
+      }
+      recruitSetupSessions.delete(sessionId);
+    }
+  }
+
   const session: RecruitSetupSession = {
     id: newSetupSessionId(),
     hostId: interaction.user.id,
@@ -521,7 +557,8 @@ export async function handleRecruitCommand(
     eventName: "人狼ゲーム",
     targetPlayerCount: DEFAULT_TARGET_PLAYER_COUNT,
     startAt: defaultRecruitStartAt(),
-    createdAt: Date.now(),
+    createdAt: now,
+    creating: false,
   };
   recruitSetupSessions.set(session.id, session);
 
@@ -546,6 +583,14 @@ export async function handleRecruitSetupSelect(
   }
 
   const { parsed, session } = state;
+  if (session.creating) {
+    await interaction.reply({
+      content: "募集を作成中です。そのままお待ちください。",
+      ephemeral: true,
+    });
+    return;
+  }
+
   const selected = interaction.values[0];
   if (!selected) return;
   const current = jstParts(session.startAt);
@@ -628,6 +673,14 @@ export async function handleRecruitSetupButton(
 
   const { parsed, session } = state;
 
+  if (session.creating) {
+    await interaction.reply({
+      content: "募集を作成中です。そのままお待ちください。",
+      ephemeral: true,
+    });
+    return;
+  }
+
   if (parsed.action === "name") {
     const input = new TextInputBuilder()
       .setCustomId("recruit-name")
@@ -674,18 +727,25 @@ export async function handleRecruitSetupButton(
     return;
   }
 
+  session.creating = true;
+  try {
+    await interaction.deferUpdate();
+  } catch (error) {
+    session.creating = false;
+    throw error;
+  }
+
   const channel = await interaction.guild.channels
     .fetch(session.channelId)
     .catch(() => null);
   if (!channel || channel.type !== ChannelType.GuildText) {
-    await interaction.reply({
+    session.creating = false;
+    await interaction.editReply({
       content: "募集先のテキストチャンネルが見つかりませんでした。",
-      ephemeral: true,
+      ...setupPanel(session),
     });
     return;
   }
-
-  await interaction.deferUpdate();
 
   let event;
   try {
@@ -693,10 +753,10 @@ export async function handleRecruitSetupButton(
       name: session.eventName,
       description: [
         "Tomatobotの人狼募集です。",
-        "参加する人はこのイベントの「興味あり」を押してください。",
+        "「興味あり」は開始通知の登録です。参加確定ではありません。",
         `予定人数：${session.targetPlayerCount}人（最大${MAX_PLAYER_COUNT}人）`,
         `開催チャンネル：<#${session.channelId}>`,
-        "開始時刻になったらホストが募集メッセージのボタンを押すと、興味ありのメンバーをロビーへ取り込みます。",
+        "開始時刻になったらホストが募集メッセージのボタンでロビーを作成します。参加する人はロビーの「参加する」を押してください。",
       ].join("\n"),
       entityType: GuildScheduledEventEntityType.External,
       privacyLevel: GuildScheduledEventPrivacyLevel.GuildOnly,
@@ -707,6 +767,7 @@ export async function handleRecruitSetupButton(
     });
   } catch (error) {
     console.error("Scheduled event creation failed:", error);
+    session.creating = false;
     await interaction.editReply({
       content:
         "Discordイベントを作成できませんでした。Botのイベント権限を確認してください。",
@@ -730,6 +791,7 @@ export async function handleRecruitSetupButton(
   } catch (error) {
     console.error("Recruitment message send failed:", error);
     await event.delete().catch(() => undefined);
+    session.creating = false;
     await interaction.editReply({
       content:
         "募集メッセージを送信できませんでした。Botのメッセージ送信権限を確認してください。",
@@ -739,6 +801,10 @@ export async function handleRecruitSetupButton(
   }
 
   recruitSetupSessions.delete(session.id);
+  recruitLastCreatedAt.set(
+    recruitHostKey(session.guildId, session.hostId),
+    Date.now(),
+  );
   const eventUrl = event.url || discordEventUrl(interaction.guildId, event.id);
   await interaction.editReply({
     content: `募集を開始しました。\n${eventUrl}`,
@@ -765,6 +831,14 @@ export async function handleRecruitSetupModal(
   }
 
   const { parsed, session } = state;
+  if (session.creating) {
+    await interaction.reply({
+      content: "募集を作成中です。そのままお待ちください。",
+      ephemeral: true,
+    });
+    return;
+  }
+
   if (parsed.action !== "name") return;
 
   if (!interaction.isFromMessage()) {
@@ -786,131 +860,4 @@ export async function handleRecruitSetupModal(
 
   session.eventName = value;
   await interaction.update(setupPanel(session));
-}
-
-export async function handleRecruitButton(
-  interaction: ButtonInteraction,
-): Promise<void> {
-  const data = parseRecruitButtonCustomId(interaction.customId);
-  if (!data) return;
-
-  if (!interaction.inGuild() || !interaction.guild) {
-    await interaction.reply({
-      content: "このボタンはサーバー内でのみ使用できます。",
-      ephemeral: true,
-    });
-    return;
-  }
-
-  if (interaction.user.id !== data.hostId) {
-    await interaction.reply({
-      content: "ロビーを作成できるのは募集ホストだけです。",
-      ephemeral: true,
-    });
-    return;
-  }
-
-  try {
-    const event = await interaction.guild.scheduledEvents.fetch(data.eventId);
-    if (!event) {
-      await interaction.reply({
-        content: "Discordイベントが見つかりませんでした。",
-        ephemeral: true,
-      });
-      return;
-    }
-
-    if (
-      event.status === GuildScheduledEventStatus.Canceled ||
-      event.status === GuildScheduledEventStatus.Completed
-    ) {
-      await interaction.reply({
-        content: "このDiscordイベントはすでに終了しています。",
-        ephemeral: true,
-      });
-      return;
-    }
-
-    const scheduledStartTimestamp = event.scheduledStartTimestamp;
-    if (!scheduledStartTimestamp) {
-      await interaction.reply({
-        content: "イベントの開始時刻を取得できませんでした。",
-        ephemeral: true,
-      });
-      return;
-    }
-
-    if (Date.now() < scheduledStartTimestamp) {
-      const unix = Math.floor(scheduledStartTimestamp / 1000);
-      await interaction.reply({
-        content: `ロビーは開始時刻の <t:${unix}:F> から作成できます（<t:${unix}:R>）。`,
-        ephemeral: true,
-      });
-      return;
-    }
-
-    const subscribers = await event.fetchSubscribers({ limit: 100 });
-    const interestedUsers = [...subscribers.values()]
-      .map((subscriber) => subscriber.user)
-      .filter((user) => !user.bot && user.id !== data.hostId);
-
-    const uniqueInterestedCount = new Set(
-      interestedUsers.map((user) => user.id),
-    ).size;
-
-    if (uniqueInterestedCount + 1 > MAX_PLAYER_COUNT) {
-      await interaction.reply({
-        content: `ホストを含めて${uniqueInterestedCount + 1}人が参加予定です。Tomatobotは最大${MAX_PLAYER_COUNT}人なので、「興味あり」を${MAX_PLAYER_COUNT - 1}人以下にしてから開始してください。`,
-        ephemeral: true,
-      });
-      return;
-    }
-
-    await createLobby(interaction, {
-      participants: interestedUsers,
-      targetPlayerCount: data.targetPlayerCount,
-    });
-
-    const reply = await interaction.fetchReply().catch(() => null);
-    const lobbyCreated = Boolean(
-      reply?.embeds.some((embed) => embed.title === "人狼ゲーム｜参加受付"),
-    );
-
-    if (lobbyCreated) {
-      const eventUrl = event.url || discordEventUrl(interaction.guildId, event.id);
-      const completedRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder()
-          .setLabel("Discordイベントを開く")
-          .setStyle(ButtonStyle.Link)
-          .setURL(eventUrl),
-        new ButtonBuilder()
-          .setCustomId(interaction.customId)
-          .setLabel("ロビー作成済み")
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(true),
-      );
-      await interaction.message
-        .edit({ components: [completedRow] })
-        .catch(() => undefined);
-    }
-  } catch (error) {
-    console.error("Scheduled event lobby import failed:", error);
-    if (interaction.replied || interaction.deferred) {
-      await interaction
-        .followUp({
-          content:
-            "イベントの参加者を取得できませんでした。イベントが削除されていないか、Botの権限を確認してください。",
-          ephemeral: true,
-        })
-        .catch(() => undefined);
-    } else {
-      await interaction
-        .reply({
-          content:
-            "イベントの参加者を取得できませんでした。イベントが削除されていないか、Botの権限を確認してください。",
-          ephemeral: true,
-        })
-        .catch(() => undefined);
-    }
-  }
 }

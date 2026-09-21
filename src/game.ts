@@ -17,7 +17,7 @@ import {
   TextInputBuilder,
   TextInputStyle,
 } from "discord.js";
-import type { Guild, MessageCreateOptions, User } from "discord.js";
+import type { Guild, MessageCreateOptions } from "discord.js";
 import { randomUUID } from "node:crypto";
 import { isBetaTester } from "./access";
 import {
@@ -1552,7 +1552,6 @@ export function syncRecommendedLobbyRoleConfig(
 }
 
 export interface CreateLobbyOptions {
-  participants?: User[];
   targetPlayerCount?: number;
 }
 
@@ -1600,21 +1599,7 @@ export async function createLobby(
     return;
   }
 
-  const participantUsers = [
-    interaction.user,
-    ...(options.participants ?? []),
-  ].filter(
-    (user, index, users) =>
-      !user.bot &&
-      users.findIndex((candidate) => candidate.id === user.id) === index,
-  );
-  if (participantUsers.length > MAX_PLAYERS) {
-    await replyLobbyError(
-      interaction,
-      `参加者が${MAX_PLAYERS}人を超えています。Discordイベントの「興味あり」を${MAX_PLAYERS}人以下にしてから、もう一度開始してください。`,
-    );
-    return;
-  }
+  const participantUsers = [interaction.user];
 
   const requestedTarget = options.targetPlayerCount ?? SOLO_PLAYER_COUNT;
   const targetPlayerCount = Math.min(

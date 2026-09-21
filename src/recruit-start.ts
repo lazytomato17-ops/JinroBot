@@ -69,11 +69,12 @@ export async function handleRecruitStartButton(
   }
 
   try {
+    await interaction.deferReply({ ephemeral: true });
+
     const event = await interaction.guild.scheduledEvents.fetch(data.eventId);
     if (!event) {
-      await interaction.reply({
+      await interaction.editReply({
         content: "Discordイベントが見つかりませんでした。",
-        ephemeral: true,
       });
       return;
     }
@@ -82,27 +83,24 @@ export async function handleRecruitStartButton(
       event.status === GuildScheduledEventStatus.Canceled ||
       event.status === GuildScheduledEventStatus.Completed
     ) {
-      await interaction.reply({
+      await interaction.editReply({
         content: "このDiscordイベントはすでに終了しています。",
-        ephemeral: true,
       });
       return;
     }
 
     const scheduledStartTimestamp = event.scheduledStartTimestamp;
     if (!scheduledStartTimestamp) {
-      await interaction.reply({
+      await interaction.editReply({
         content: "イベントの開始時刻を取得できませんでした。",
-        ephemeral: true,
       });
       return;
     }
 
     if (Date.now() < scheduledStartTimestamp) {
       const unix = Math.floor(scheduledStartTimestamp / 1000);
-      await interaction.reply({
+      await interaction.editReply({
         content: `ロビーは開始時刻の <t:${unix}:F> から作成できます（<t:${unix}:R>）。`,
-        ephemeral: true,
       });
       return;
     }
@@ -125,6 +123,7 @@ export async function handleRecruitStartButton(
 
     const reply = await interaction.fetchReply().catch(() => null);
     const lobbyCreated = Boolean(
+      reply?.content.startsWith("ロビーを作成しました。") ||
       reply?.embeds.some((embed) => embed.title === "人狼ゲーム｜参加受付"),
     );
     if (!lobbyCreated) return;
@@ -161,10 +160,9 @@ export async function handleRecruitStartButton(
     console.error("Scheduled event lobby import failed:", error);
     if (interaction.replied || interaction.deferred) {
       await interaction
-        .followUp({
+        .editReply({
           content:
             "イベントの参加者を確認できませんでした。イベントが削除されていないか、Botの権限を確認してください。",
-          ephemeral: true,
         })
         .catch(() => undefined);
     } else {
