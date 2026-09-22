@@ -5,6 +5,7 @@ import {
   ButtonStyle,
   ChannelType,
   GuildScheduledEventStatus,
+  MessageFlags,
 } from "discord.js";
 import { createLobby } from "./game";
 import { parseRecruitButtonCustomId } from "./scheduled-event";
@@ -46,7 +47,7 @@ export async function handleRecruitStartButton(
   if (!interaction.inGuild() || !interaction.guild) {
     await interaction.reply({
       content: "このボタンはサーバー内でのみ使用できます。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -55,7 +56,7 @@ export async function handleRecruitStartButton(
   if (!channel || channel.type !== ChannelType.GuildText) {
     await interaction.reply({
       content: "サーバーのテキストチャンネルで実行してください。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -63,13 +64,13 @@ export async function handleRecruitStartButton(
   if (interaction.user.id !== data.hostId) {
     await interaction.reply({
       content: "ロビーを作成できるのは募集ホストだけです。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
 
   try {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const event = await interaction.guild.scheduledEvents.fetch(data.eventId);
     if (!event) {
@@ -170,7 +171,7 @@ export async function handleRecruitStartButton(
         .reply({
           content:
             "イベントの参加者を確認できませんでした。イベントが削除されていないか、Botの権限を確認してください。",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         })
         .catch(() => undefined);
     }

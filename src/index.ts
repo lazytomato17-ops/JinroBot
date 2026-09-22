@@ -4,6 +4,7 @@ import {
   Client,
   Events,
   GatewayIntentBits,
+  MessageFlags,
   Partials,
   PermissionFlagsBits,
   SlashCommandBuilder,
@@ -131,7 +132,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.commandName === "jinro") {
         await createLobby(interaction);
       } else if (interaction.commandName === "reset") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const result = await resetChannel(interaction.channelId, true, {
           userId: interaction.user.id,
           canManageMessages: Boolean(
@@ -223,7 +224,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     console.error("Interaction error:", error);
     const message = {
       content: "処理中にエラーが発生しました。",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     } as const;
     if (interaction.isRepliable()) {
       if (interaction.replied || interaction.deferred)

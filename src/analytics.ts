@@ -1,5 +1,6 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { createHmac } from "node:crypto";
+import type { GameplayAnalyticsSummary } from "./match-analytics";
 import type { Winner } from "./types";
 
 const REQUEST_TIMEOUT_MS = 5000;
@@ -176,6 +177,14 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
+function isMissingGameplaySummaryColumn(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = "code" in error ? String(error.code) : "";
+  return (
+    code === "PGRST204" && errorMessage(error).includes("gameplay_summary")
+  );
+}
+
 async function save(
   action: string,
   operation: (client: SupabaseClient) => PromiseLike<{ error: unknown }>,
@@ -217,7 +226,7 @@ function sessionRow(
   };
 }
 
-function analyticsAppVersion(explicit?: string): string {
+export function analyticsAppVersion(explicit?: string): string {
   const explicitVersion = explicit?.trim();
   const releaseVersion =
     process.env.TOMATOBOT_VERSION?.trim() ||
@@ -292,23 +301,35 @@ export async function recordGameCompleted(
     dayCount: number;
     durationSeconds: number;
     startedAt?: string;
+    gameplaySummary?: GameplayAnalyticsSummary;
   },
 ): Promise<AnalyticsResult> {
   const completedAt = new Date();
   const [sessionResult] = await Promise.all([
-    save("complete", (client) =>
-      client.from("tomatobot_play_sessions").upsert(
-        {
-          ...sessionRow(input, "completed"),
-          winner: input.winner,
-          day_count: input.dayCount,
-          duration_seconds: input.durationSeconds,
-          started_at: input.startedAt,
-          finished_at: completedAt.toISOString(),
-        },
-        { onConflict: "id" },
-      ),
-    ),
+    save("complete", async (client) => {
+      const row = {
+        ...sessionRow(input, "completed"),
+        winner: input.winner,
+        day_count: input.dayCount,
+        duration_seconds: input.durationSeconds,
+        started_at: input.startedAt,
+        finished_at: completedAt.toISOString(),
+        gameplay_summary: input.gameplaySummary,
+      };
+      const result = await client
+        .from("tomatobot_play_sessions")
+        .upsert(row, { onConflict: "id" });
+      if (isMissingGameplaySummaryColumn(result.error)) {
+        const { gameplay_summary: _summary, ...legacyRow } = row;
+        console.warn(
+          "Gameplay analytics migration is not applied; saving the legacy completion row.",
+        );
+        return client
+          .from("tomatobot_play_sessions")
+          .upsert(legacyRow, { onConflict: "id" });
+      }
+      return result;
+    }),
     recordGuildFunnelEvent(input.guildId, "game_completed", completedAt),
   ]);
   return sessionResult;

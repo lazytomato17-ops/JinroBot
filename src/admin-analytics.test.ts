@@ -184,6 +184,51 @@ describe("運営レポート", () => {
     expect(content).toContain("導入分析用のSQLが未適用");
   });
 
+  it("最新版だけの勝敗と匿名CO・能力集計を表示する", () => {
+    const version = "2.2.0+79721cfdc914";
+    const report = buildAdminAnalyticsReport(
+      [],
+      [],
+      [
+        {
+          id: "latest",
+          app_version: version,
+          started_at: "2026-08-30T01:00:00Z",
+          status: "completed",
+          winner: "villager",
+          role_config: { 人狼: 1, 暗殺者: 1 },
+          gameplay_summary: {
+            schema: 1,
+            claims: {
+              total: 3,
+              human: 1,
+              npc: 2,
+              retractions: 1,
+              byRole: {},
+            },
+            nightActions: {
+              assassinate: { total: 1, human: 0, npc: 1 },
+            },
+            voteRounds: 1,
+          },
+        },
+      ],
+      undefined,
+      undefined,
+      new Date("2026-08-30T03:00:00.000Z"),
+      undefined,
+      undefined,
+      version,
+    );
+
+    const content = JSON.stringify(adminAnalyticsEmbed(report).toJSON());
+    expect(content).toContain("最新版の実戦");
+    expect(content).toContain("村 **1**｜狼 **0**");
+    expect(content).toContain("CO **3**（人 1・NPC 2）｜撤回 **1**");
+    expect(content).toContain("暗殺 1（NPC 1）");
+    expect(content).toContain("30完走未満");
+  });
+
   it("導入後の案内・募集・初戦と退出を期間別に集計する", () => {
     const range = analyticsRange(new Date("2026-08-30T03:00:00.000Z"));
     const summary = buildGuildFunnelSummary(

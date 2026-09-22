@@ -3,6 +3,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ChannelType,
+  MessageFlags,
   PermissionFlagsBits,
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
@@ -81,7 +82,7 @@ export async function handleGuideCommand(
   await interaction.reply({
     content: guideText(),
     components: guideComponents(),
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -91,7 +92,7 @@ export async function handleHelpCommand(
   await interaction.reply({
     content: helpText(),
     components: guideComponents(),
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -101,7 +102,7 @@ export async function handleInviteCommand(
   await interaction.reply({
     content: inviteText(),
     components: inviteComponents(),
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 

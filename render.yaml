@@ -2,9 +2,9 @@ services:
   - type: web
     name: tomatobot
     runtime: docker
-    plan: starter
+    plan: free
     region: singapore
-    repo: https://github.com/lazytomato17-ops/tomatobot
+    repo: https://github.com/lazytomato17-ops/JinroBot
     branch: main
     dockerfilePath: ./Dockerfile
     healthCheckPath: /

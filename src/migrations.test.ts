@@ -35,4 +35,17 @@ describe("Supabase移行SQL", () => {
     expect(redaction).toContain("tomatobot_play_sessions_no_raw_guild_id");
     expect(redaction).toContain("tomatobot_matches_location_not_collected");
   });
+
+  it("試合分析は個人を保存せず集約JSONだけを受け付ける", () => {
+    const gameplay = migration(
+      "202609210001_add_gameplay_summary.sql",
+    );
+
+    expect(gameplay).toContain("add column if not exists gameplay_summary jsonb");
+    expect(gameplay).toContain("gameplay_summary @> '{\"schema\": 1}'::jsonb");
+    expect(gameplay).toContain("octet_length(gameplay_summary::text) <= 20000");
+    expect(gameplay).not.toContain("user_id");
+    expect(gameplay).not.toContain("participant_hash");
+    expect(gameplay).not.toContain("target_id");
+  });
 });

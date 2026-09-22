@@ -160,11 +160,29 @@ describe("中断理由の保存", () => {
         dayCount: 3,
         durationSeconds: 180,
         startedAt: "2026-08-30T01:00:00.000Z",
+        gameplaySummary: {
+          schema: 1,
+          claims: {
+            total: 2,
+            human: 1,
+            npc: 1,
+            retractions: 0,
+            byRole: {},
+          },
+          nightActions: {
+            assassinate: { total: 1, human: 0, npc: 1 },
+          },
+          voteRounds: 2,
+        },
       }),
     ).resolves.toEqual({ status: "saved" });
 
     expect(mocks.upsert.mock.calls[0][0]).toEqual(
-      expect.objectContaining({ status: "completed", winner: "villager" }),
+      expect.objectContaining({
+        status: "completed",
+        winner: "villager",
+        gameplay_summary: expect.objectContaining({ schema: 1 }),
+      }),
     );
     expect(mocks.rpc).toHaveBeenCalledWith(
       "tomatobot_record_guild_funnel_event",
@@ -175,6 +193,55 @@ describe("中断理由の保存", () => {
     );
     expect(JSON.stringify(mocks.rpc.mock.calls)).not.toContain(
       "1503293657250529433",
+    );
+  });
+
+  it("移行SQLが未適用でも従来形式で完走記録を残す", async () => {
+    process.env.TOMATOBOT_ANALYTICS_HMAC_SECRET = "analytics-test-secret";
+    mocks.upsert
+      .mockResolvedValueOnce({
+        data: null,
+        error: {
+          code: "PGRST204",
+          message: "gameplay_summary column is missing",
+        },
+      })
+      .mockResolvedValueOnce({ data: null, error: null });
+    mocks.rpc.mockResolvedValue({ data: null, error: null });
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { recordGameCompleted } = await import("./analytics");
+
+    await expect(
+      recordGameCompleted({
+        sessionId: "0190cf7d-2f0d-7cb3-b815-f59fb6adc95a",
+        guildId: "1503293657250529433",
+        channelId: "1503293657900515350",
+        targetPlayerCount: 7,
+        humanCount: 1,
+        npcCount: 6,
+        roleConfig: { 人狼: 1, 村人: 6 },
+        winner: "villager",
+        dayCount: 3,
+        durationSeconds: 180,
+        gameplaySummary: {
+          schema: 1,
+          claims: {
+            total: 0,
+            human: 0,
+            npc: 0,
+            retractions: 0,
+            byRole: {},
+          },
+          nightActions: {},
+          voteRounds: 1,
+        },
+      }),
+    ).resolves.toEqual({ status: "saved" });
+
+    expect(mocks.upsert).toHaveBeenCalledTimes(2);
+    expect(mocks.upsert.mock.calls[0][0]).toHaveProperty("gameplay_summary");
+    expect(mocks.upsert.mock.calls[1][0]).not.toHaveProperty(
+      "gameplay_summary",
     );
   });
 });
