@@ -149,7 +149,10 @@ export interface GameState {
   divisionGroups?: Map<string, "A" | "B">;
   divisionChannels?: Map<"A" | "B", TextChannel>;
   divisionPhaseMessages?: Message[];
-  divisionOriginalViewPermissions?: Map<string, "allow" | "deny" | "inherit">;
+  divisionOriginalChannelPermissions?: Map<
+    string,
+    "allow" | "deny" | "inherit"
+  >;
   loquaciousMissions?: Map<string, string>;
   loquaciousCompleted?: Set<string>;
   timers: NodeJS.Timeout[];

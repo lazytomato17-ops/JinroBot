@@ -122,7 +122,8 @@ const LOQUACIOUS_WORDS = [
   "対抗",
   "様子",
 ];
-const DIVISION_CHANNEL_TOPIC_PREFIX = "jinrobot-division:v1:";
+const DIVISION_CHANNEL_TOPIC_PREFIX_V1 = "jinrobot-division:v1:";
+const DIVISION_CHANNEL_TOPIC_PREFIX = "jinrobot-division:v2:";
 
 const games = new Map<string, GameState>();
 
@@ -415,16 +416,17 @@ function gameForChannelId(channelId: string): GameState | undefined {
   );
 }
 
-type ExplicitViewPermission = "allow" | "deny" | "inherit";
+type ExplicitChannelPermission = "allow" | "deny" | "inherit";
 
 interface DivisionRecoverySnapshot {
   mainChannelId: string;
-  permissions: Map<string, ExplicitViewPermission>;
+  permissions: Map<string, ExplicitChannelPermission>;
+  permission: "ViewChannel" | "SendMessages";
 }
 
 function divisionRecoveryTopic(
   mainChannelId: string,
-  permissions: ReadonlyMap<string, ExplicitViewPermission>,
+  permissions: ReadonlyMap<string, ExplicitChannelPermission>,
 ): string {
   const code = { allow: "a", deny: "d", inherit: "i" } as const;
   const entries = [...permissions].map(
@@ -436,14 +438,19 @@ function divisionRecoveryTopic(
 export function divisionRecoverySnapshotFromTopic(
   topic: string | null,
 ): DivisionRecoverySnapshot | undefined {
-  if (!topic?.startsWith(DIVISION_CHANNEL_TOPIC_PREFIX)) return undefined;
-  const payload = topic.slice(DIVISION_CHANNEL_TOPIC_PREFIX.length);
+  const prefix = topic?.startsWith(DIVISION_CHANNEL_TOPIC_PREFIX)
+    ? DIVISION_CHANNEL_TOPIC_PREFIX
+    : topic?.startsWith(DIVISION_CHANNEL_TOPIC_PREFIX_V1)
+      ? DIVISION_CHANNEL_TOPIC_PREFIX_V1
+      : undefined;
+  if (!prefix) return undefined;
+  const payload = (topic ?? "").slice(prefix.length);
   const separator = payload.indexOf(":");
   if (separator < 1) return undefined;
   const mainChannelId = payload.slice(0, separator);
   if (!/^\d+$/.test(mainChannelId)) return undefined;
-  const permissions = new Map<string, ExplicitViewPermission>();
-  const permissionCode: Record<string, ExplicitViewPermission> = {
+  const permissions = new Map<string, ExplicitChannelPermission>();
+  const permissionCode: Record<string, ExplicitChannelPermission> = {
     a: "allow",
     d: "deny",
     i: "inherit",
@@ -454,21 +461,31 @@ export function divisionRecoverySnapshotFromTopic(
     if (!/^\d+$/.test(id) || !permission) return undefined;
     permissions.set(id, permission);
   }
-  return permissions.size > 0 ? { mainChannelId, permissions } : undefined;
+  return permissions.size > 0
+    ? {
+        mainChannelId,
+        permissions,
+        permission:
+          prefix === DIVISION_CHANNEL_TOPIC_PREFIX
+            ? "SendMessages"
+            : "ViewChannel",
+      }
+    : undefined;
 }
 
-function explicitViewPermission(
+function explicitChannelPermission(
   channel: TextChannel,
   overwriteId: string,
-): ExplicitViewPermission {
+  permission: "ViewChannel" | "SendMessages",
+): ExplicitChannelPermission {
   const overwrite = channel.permissionOverwrites.cache.get(overwriteId);
-  if (overwrite?.allow.has(PermissionFlagsBits.ViewChannel)) return "allow";
-  if (overwrite?.deny.has(PermissionFlagsBits.ViewChannel)) return "deny";
+  if (overwrite?.allow.has(PermissionFlagsBits[permission])) return "allow";
+  if (overwrite?.deny.has(PermissionFlagsBits[permission])) return "deny";
   return "inherit";
 }
 
-function viewPermissionValue(
-  permission: ExplicitViewPermission,
+function channelPermissionValue(
+  permission: ExplicitChannelPermission,
 ): boolean | null {
   if (permission === "allow") return true;
   if (permission === "deny") return false;
@@ -505,19 +522,19 @@ async function restoreDivisionChannels(
   reason: string,
 ): Promise<void> {
   const channels = [...(game.divisionChannels?.values() ?? [])];
-  const originalPermissions = game.divisionOriginalViewPermissions;
+  const originalPermissions = game.divisionOriginalChannelPermissions;
 
   if (originalPermissions) {
     for (const [overwriteId, permission] of originalPermissions) {
       await game.channel.permissionOverwrites.edit(overwriteId, {
-        ViewChannel: viewPermissionValue(permission),
+        SendMessages: channelPermissionValue(permission),
       });
     }
   }
 
   game.divisionChannels = undefined;
   game.divisionPhaseMessages = undefined;
-  game.divisionOriginalViewPermissions = undefined;
+  game.divisionOriginalChannelPermissions = undefined;
   game.divisionGroups = new Map();
 
   await Promise.all(
@@ -555,9 +572,14 @@ async function activateDivisionChannels(game: GameState): Promise<boolean> {
 
   const everyoneId = game.channel.guild.roles.everyone.id;
   const humanIds = aliveHumans(game).map((player) => player.id);
-  const overwriteIds = [everyoneId, ...humanIds];
-  game.divisionOriginalViewPermissions = new Map(
-    overwriteIds.map((id) => [id, explicitViewPermission(game.channel, id)]),
+  // Discord forbids hiding an onboarding channel from @everyone (API 350003).
+  // Keep the game channel readable and pause only participants' messages there.
+  const overwriteIds = humanIds;
+  game.divisionOriginalChannelPermissions = new Map(
+    overwriteIds.map((id) => [
+      id,
+      explicitChannelPermission(game.channel, id, "SendMessages"),
+    ]),
   );
   game.divisionChannels = new Map();
 
@@ -575,7 +597,7 @@ async function activateDivisionChannels(game: GameState): Promise<boolean> {
         parent: game.channel.parentId,
         topic: divisionRecoveryTopic(
           game.channelId,
-          game.divisionOriginalViewPermissions,
+          game.divisionOriginalChannelPermissions,
         ),
         permissionOverwrites: [
           {
@@ -606,7 +628,7 @@ async function activateDivisionChannels(game: GameState): Promise<boolean> {
 
     for (const overwriteId of overwriteIds) {
       await game.channel.permissionOverwrites.edit(overwriteId, {
-        ViewChannel: false,
+        SendMessages: false,
       });
     }
     return true;
@@ -619,7 +641,7 @@ async function activateDivisionChannels(game: GameState): Promise<boolean> {
     }
     await game.channel
       .send(
-        "⚠️ 分断用チャンネルを作成できなかったため、今回は分断せずに進行します。Botの「チャンネル管理」権限を確認してください。",
+        "⚠️ 分断用チャンネルの準備に失敗したため、今回は分断せずに進行します。Botのチャンネル権限やサーバー設定を確認してください。",
       )
       .catch(() => undefined);
     return false;
@@ -656,7 +678,8 @@ export async function recoverOrphanedDivisionChannels(
           for (const [overwriteId, permission] of entries[0].snapshot
             .permissions) {
             await mainChannel.permissionOverwrites.edit(overwriteId, {
-              ViewChannel: viewPermissionValue(permission),
+              [entries[0].snapshot.permission]:
+                channelPermissionValue(permission),
             });
           }
         }
@@ -2584,7 +2607,7 @@ async function startGame(game: GameState): Promise<void> {
     game.divisionGroups = new Map();
     game.divisionChannels = undefined;
     game.divisionPhaseMessages = undefined;
-    game.divisionOriginalViewPermissions = undefined;
+    game.divisionOriginalChannelPermissions = undefined;
     game.loquaciousMissions = new Map();
     game.loquaciousCompleted = new Set();
     game.pendingDmMessages.clear();
@@ -6784,7 +6807,7 @@ export function prepareRematchGame(
     divisionGroups: new Map(),
     divisionChannels: undefined,
     divisionPhaseMessages: undefined,
-    divisionOriginalViewPermissions: undefined,
+    divisionOriginalChannelPermissions: undefined,
     loquaciousMissions: new Map(),
     loquaciousCompleted: new Set(),
     votes: new Map(),
