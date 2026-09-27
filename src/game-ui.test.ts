@@ -1,4 +1,4 @@
-import type { TextChannel } from "discord.js";
+import { ChannelType, type Guild, type TextChannel } from "discord.js";
 import { describe, expect, it, vi } from "vitest";
 import {
   abandonReasonFromAction,
@@ -18,6 +18,7 @@ import {
   dayEmbed,
   divisionGroupsForPlayers,
   divisionRecoverySnapshotFromTopic,
+  recoverOrphanedDivisionChannels,
   eliminateWithLovers,
   finishedDayEmbed,
   fillMissingNightAction,
@@ -1708,8 +1709,51 @@ describe("ゲーム画面", () => {
       ["234567890123456789", "inherit"],
       ["345678901234567890", "allow"],
     ]);
+    expect(snapshot?.permission).toBe("ViewChannel");
+    expect(
+      divisionRecoverySnapshotFromTopic(
+        "jinrobot-division:v2:123456789012345678:234567890123456789.i",
+      )?.permission,
+    ).toBe("SendMessages");
     expect(divisionRecoverySnapshotFromTopic("unrelated")).toBeUndefined();
   });
+
+  it.each([
+    ["v1", "ViewChannel"],
+    ["v2", "SendMessages"],
+  ] as const)(
+    "Bot再起動時に分断%sの元の権限だけを復旧する",
+    async (version, permission) => {
+      const edit = vi.fn().mockResolvedValue(undefined);
+      const remove = vi.fn().mockResolvedValue(undefined);
+      const mainChannel = {
+        type: ChannelType.GuildText,
+        permissionOverwrites: { edit },
+      };
+      const divisionChannel = {
+        type: ChannelType.GuildText,
+        topic: `jinrobot-division:${version}:123456789012345678:234567890123456789.i`,
+        delete: remove,
+      };
+      const channels = new Map([
+        ["123456789012345678", mainChannel],
+        ["345678901234567890", divisionChannel],
+      ]);
+      const guild = {
+        id: "456789012345678901",
+        channels: {
+          cache: channels,
+          fetch: vi.fn().mockResolvedValue(undefined),
+        },
+      } as unknown as Guild;
+
+      expect(await recoverOrphanedDivisionChannels([guild])).toBe(1);
+      expect(edit).toHaveBeenCalledWith("234567890123456789", {
+        [permission]: null,
+      });
+      expect(remove).toHaveBeenCalledOnce();
+    },
+  );
 
   it("市長の投票を2票として集計する", () => {
     const game = makeGame(["市長", "人狼", "占い師", "村人"]);
