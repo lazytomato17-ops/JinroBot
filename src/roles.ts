@@ -124,17 +124,20 @@ export const ROLE_INFO: Record<
   逃亡者: {
     icon: "🏃",
     team: "villager",
-    description: "夜に1人のもとへ逃げます。相手が人狼か襲撃対象だと死亡します。",
+    description:
+      "夜に1人のもとへ逃げます。相手が人狼か襲撃対象だと死亡します。",
   },
   暗殺者: {
     icon: "🗡️",
     team: "villager",
-    description: "一度だけ夜に1人を暗殺できます。村人陣営を撃つと自分も死亡します。",
+    description:
+      "一度だけ夜に1人を暗殺できます。村人陣営を撃つと自分も死亡します。",
   },
   猫又: {
     icon: "🐈",
     team: "villager",
-    description: "死亡時に道連れを起こします。処刑なら生存者、人狼襲撃なら人狼から選ばれます。",
+    description:
+      "死亡時に道連れを起こします。処刑なら生存者、人狼襲撃なら人狼から選ばれます。",
   },
   狂信者: {
     icon: "🐾",
@@ -144,7 +147,8 @@ export const ROLE_INFO: Record<
   妖術師: {
     icon: "🪄",
     team: "wolf",
-    description: "人狼陣営です。夜に1人の本当の役職を確認できます。",
+    description:
+      "人狼陣営です。最初の議論前と毎晩、1人の本当の役職を確認できます。",
   },
   分断者: {
     icon: "✂️",
@@ -154,17 +158,20 @@ export const ROLE_INFO: Record<
   妖狐: {
     icon: "🦊",
     team: "third",
-    description: "人狼の襲撃では死亡せず、占われると死亡します。決着時に生存していれば単独勝利です。",
+    description:
+      "人狼の襲撃では死亡せず、占われると死亡します。決着時に生存していれば単独勝利です。",
   },
   キューピッド: {
     icon: "💘",
     team: "third",
-    description: "最初の夜に恋人2人を結びます。恋人が2人とも生き残れば一緒に勝利します。",
+    description:
+      "最初の議論前に恋人2人を結びます。恋人が2人とも生き残れば一緒に勝利します。",
   },
   純愛者: {
     icon: "💝",
     team: "third",
-    description: "最初の夜に想い人を1人選び、その人が生存して勝利すると追加勝利します。",
+    description:
+      "最初の議論前に想い人を1人選び、その人が生存して勝利すると追加勝利します。",
   },
   方位磁針: {
     icon: "🧭",
@@ -184,7 +191,8 @@ export const ROLE_INFO: Record<
   パン屋: {
     icon: "🥐",
     team: "villager",
-    description: "生存中は毎朝パンを届けます。パンが届かなくなると死亡が分かります。",
+    description:
+      "生存中は毎朝パンを届けます。パンが届かなくなると死亡が分かります。",
   },
   市長: {
     icon: "🎖️",
@@ -204,9 +212,30 @@ export const ROLE_INFO: Record<
   饒舌な人狼: {
     icon: "🗣️",
     team: "wolf",
-    description: "人狼です。毎日指定されるお題を議論中に達成できないと夜に死亡します。",
+    description:
+      "人狼です。毎日指定されるお題を議論中に達成できないと夜に死亡します。",
   },
 };
+
+export const BASIC_CONFIGURABLE_ROLES: RoleName[] = [
+  "人狼",
+  "占い師",
+  "騎士",
+  "霊能者",
+  "狂人",
+];
+
+// 設定画面だけの表示順。役職トークンで使う ROLE_NAMES の順番は変えない。
+export const CONFIGURABLE_ROLE_DISPLAY_NAMES: RoleName[] = [
+  ...BASIC_CONFIGURABLE_ROLES,
+  ...(["villager", "wolf", "third"] as const).flatMap((team) =>
+    CONFIGURABLE_ROLE_NAMES.filter(
+      (role) =>
+        !BASIC_CONFIGURABLE_ROLES.includes(role) &&
+        ROLE_INFO[role].team === team,
+    ),
+  ),
+];
 
 export function emptyRoleConfig(): RoleConfig {
   return Object.fromEntries(ROLE_NAMES.map((role) => [role, 0])) as RoleConfig;
@@ -306,7 +335,8 @@ export function buildCustomRoles(
       sum + (ROLE_INFO[role].team === "villager" ? normalized[role] : 0),
     0,
   );
-  const villagerTeamCount = configuredVillagerCount + playerCount - specialCount;
+  const villagerTeamCount =
+    configuredVillagerCount + playerCount - specialCount;
   if (villagerTeamCount < 1) {
     throw new Error("村人陣営は1人以上必要です。");
   }
@@ -364,7 +394,9 @@ export function getWinner(
     wolves === 0 ? "villager" : wolves >= humans ? "wolf" : null;
   if (!normalWinner) return null;
 
-  const aliveIds = new Set(alive.flatMap((player) => (player.id ? [player.id] : [])));
+  const aliveIds = new Set(
+    alive.flatMap((player) => (player.id ? [player.id] : [])),
+  );
   if (
     context.loverPairs?.some(
       ([left, right]) => aliveIds.has(left) && aliveIds.has(right),

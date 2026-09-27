@@ -132,6 +132,34 @@ describe("NPC投票", () => {
     expect(target).toBe("npc-b");
   });
 
+  it("共有者NPCは初回・再投票とも既知の相方を避ける", () => {
+    const actor = { id: "shared-a", role: "共有者" as const };
+    const candidates = [
+      { id: "shared-b", role: "共有者" as const },
+      { id: "wolf", role: "人狼" as const },
+    ];
+    const suspicion = new Map([
+      ["shared-b", 100],
+      ["wolf", 0],
+    ]);
+    expect(chooseNpcVoteTarget(actor, candidates, suspicion, () => 0)).toBe(
+      "wolf",
+    );
+    expect(
+      chooseNpcRevoteTarget(
+        actor,
+        candidates,
+        suspicion,
+        "shared-b",
+        new Map([["shared-b", 3]]),
+        () => 0,
+      ),
+    ).toBe("wolf");
+    expect(
+      chooseNpcVoteTarget(actor, candidates.slice(0, 1), suspicion, () => 0),
+    ).toBe("shared-b");
+  });
+
   it("慎重派は証拠を優先し、直感派は大きく揺れる", () => {
     const candidates = [
       { id: "evidence", role: "村人" as const },

@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildCustomRoles,
   buildRoles,
+  CONFIGURABLE_ROLE_DISPLAY_NAMES,
+  CONFIGURABLE_ROLE_NAMES,
   getWinner,
   LEGACY_ROLE_NAMES,
   ROLE_INFO,
@@ -12,6 +14,29 @@ import {
 import type { RoleConfig } from "./types";
 
 describe("buildRoles", () => {
+  it("配役設定では基本役を先頭に置き、残りは陣営順に表示する", () => {
+    expect(CONFIGURABLE_ROLE_DISPLAY_NAMES.slice(0, 5)).toEqual([
+      "人狼",
+      "占い師",
+      "騎士",
+      "霊能者",
+      "狂人",
+    ]);
+    expect(new Set(CONFIGURABLE_ROLE_DISPLAY_NAMES)).toEqual(
+      new Set(CONFIGURABLE_ROLE_NAMES),
+    );
+    const additionalTeams = CONFIGURABLE_ROLE_DISPLAY_NAMES.slice(5).map(
+      (role) => ROLE_INFO[role].team,
+    );
+    expect(additionalTeams).toEqual(
+      [...additionalTeams].sort(
+        (left, right) =>
+          ["villager", "wolf", "third"].indexOf(left) -
+          ["villager", "wolf", "third"].indexOf(right),
+      ),
+    );
+  });
+
   it("4人村は人狼1・占い師1・村人2になる", () => {
     expect(buildRoles(4).sort()).toEqual(
       ["人狼", "占い師", "村人", "村人"].sort(),
@@ -91,9 +116,7 @@ describe("getWinner", () => {
       { id: "b", role: "狂人" as const, alive: true },
     ];
     expect(getWinner(players)).toBe("fox");
-    expect(getWinner(players, { loverPairs: [["a", "b"]] })).toBe(
-      "lovers",
-    );
+    expect(getWinner(players, { loverPairs: [["a", "b"]] })).toBe("lovers");
   });
 });
 

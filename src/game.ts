@@ -38,8 +38,10 @@ import {
 } from "./analytics";
 import { buildGameplayAnalyticsSummary } from "./match-analytics";
 import {
+  BASIC_CONFIGURABLE_ROLES,
   buildCustomRoles,
   buildRoles,
+  CONFIGURABLE_ROLE_DISPLAY_NAMES,
   CONFIGURABLE_ROLE_NAMES,
   getWinner,
   isActualWolfRole,
@@ -104,6 +106,7 @@ const NIGHT_REVEAL_SECONDS = 6;
 const SEER_AUTO_SECONDS = 30;
 const RESULT_HOLD_SECONDS = 4;
 const START_HOLD_SECONDS = 4;
+const OPENING_CHOICE_SECONDS = 30;
 const MIN_PLAYERS = 4;
 const MAX_PLAYERS = 15;
 const NPC_QUESTIONS_PER_DAY = 2;
@@ -2169,6 +2172,13 @@ function canUseRoleCount(
   }
 }
 
+function roleConfigCategory(role: RoleName): string {
+  if (BASIC_CONFIGURABLE_ROLES.includes(role)) return "基本役";
+  if (ROLE_INFO[role].team === "villager") return "村人陣営";
+  if (ROLE_INFO[role].team === "wolf") return "人狼陣営";
+  return "第三陣営";
+}
+
 export function roleConfigPanel(
   game: GameState,
   selectedRole: ConfigurableRole = "人狼",
@@ -2178,8 +2188,8 @@ export function roleConfigPanel(
     .setTitle(`配役設定｜${game.targetPlayerCount}人`)
     .setDescription(
       betaTester
-        ? "βテスター自由配役｜共有者は2人単位ですが、各役職の個別上限はありません。自由配役は戦績対象外です。"
-        : "役職を選び、人数を調整してください。追加役職を使う試合は戦績対象外です。",
+        ? "基本役→村人陣営→人狼陣営→第三陣営の順です。個別上限なし。追加役職・通常上限超過・逆村は戦績対象外です。"
+        : "基本役→村人陣営→人狼陣営→第三陣営の順です。追加役職を使う試合は戦績対象外です。",
     )
     .addFields(
       { name: "現在の配役", value: roleConfigRows(game) },
@@ -2197,9 +2207,9 @@ export function roleConfigPanel(
         .setCustomId(componentId("role-config-select", game))
         .setPlaceholder("変更する役職を選ぶ")
         .addOptions(
-          CONFIGURABLE_ROLE_NAMES.map((role) => ({
+          CONFIGURABLE_ROLE_DISPLAY_NAMES.map((role) => ({
             label: `${ROLE_INFO[role].icon} ${role}`,
-            description: `${ROLE_INFO[role].description.slice(0, 82)} (${game.roleConfig[role]}人)`,
+            description: `${roleConfigCategory(role)}｜${ROLE_INFO[role].description.slice(0, 68)} (${game.roleConfig[role]}人)`,
             value: configurableRoleToken(role as ConfigurableRole),
             default: role === selectedRole,
           })),
@@ -2287,7 +2297,10 @@ async function handleRoleConfigButton(
     return;
   }
 
-  await interaction.reply({ ...roleConfigPanel(game), flags: MessageFlags.Ephemeral });
+  await interaction.reply({
+    ...roleConfigPanel(game),
+    flags: MessageFlags.Ephemeral,
+  });
 }
 
 async function handleRoleConfigAdjust(
@@ -2505,9 +2518,16 @@ export function roleDmEmbed(game: GameState, player: Player): EmbedBuilder {
 }
 
 export function gameStartEmbed(game: GameState): EmbedBuilder {
+  const openingChoices = game.players.some(
+    (player) => player.alive && openingActionForPlayer(player),
+  );
   return new EmbedBuilder()
     .setTitle(`ゲーム開始｜${game.players.length}人`)
-    .setDescription("役職をDMに送信しました。\n確認したらゲーム開始です。")
+    .setDescription(
+      openingChoices
+        ? "役職をDMに送信しました。開始前の役職選択が終わると議論が始まります。"
+        : "役職をDMに送信しました。\n確認したらゲーム開始です。",
+    )
     .addFields({ name: "配役", value: roleConfigRows(game) })
     .setColor(COLORS.lobby)
     .setFooter({ text: "まもなく最初の議論が始まります" });
@@ -2653,7 +2673,7 @@ async function startGame(game: GameState): Promise<void> {
   if (games.get(game.channelId) !== game) return;
   game.phaseMessage = undefined;
   clearGameTimers(game);
-  schedule(game, START_HOLD_SECONDS * 1000, () => startDay(game));
+  await startOpeningSetup(game);
 }
 
 function activeHumanPlayer(
@@ -3043,7 +3063,10 @@ async function handleClaimButton(
     });
     return;
   }
-  await interaction.reply({ ...claimPanel(game, claimant), flags: MessageFlags.Ephemeral });
+  await interaction.reply({
+    ...claimPanel(game, claimant),
+    flags: MessageFlags.Ephemeral,
+  });
 }
 
 async function handleQuickResultClaim(
@@ -4782,6 +4805,7 @@ type NightAction =
   | "cupid"
   | "devotee"
   | "thief";
+type OpeningAction = "cupid" | "devotee" | "sorcery";
 
 const NIGHT_ACTION_ROLE: Record<Exclude<NightAction, "kill">, RoleName> = {
   seer: "占い師",
@@ -4842,6 +4866,25 @@ function nightTargets(
   return living.filter((target) => target.id !== player.id);
 }
 
+export function openingActionForPlayer(
+  player: Pick<Player, "alive" | "role">,
+): OpeningAction | undefined {
+  if (!player.alive) return undefined;
+  if (player.role === "キューピッド") return "cupid";
+  if (player.role === "純愛者") return "devotee";
+  if (player.role === "妖術師") return "sorcery";
+  return undefined;
+}
+
+function openingActors(
+  game: GameState,
+): Array<{ player: Player; action: OpeningAction }> {
+  return alivePlayers(game).flatMap((player) => {
+    const action = openingActionForPlayer(player);
+    return action ? [{ player, action }] : [];
+  });
+}
+
 function expectedNightActions(game: GameState): string[] {
   const expected: string[] = [];
   for (const player of alivePlayers(game)) {
@@ -4857,17 +4900,21 @@ async function sendNightMenu(
   action: NightAction,
   prompt: string,
   targets: Player[],
-  options: { targetCount?: number; allowSkip?: boolean } = {},
+  options: {
+    targetCount?: number;
+    allowSkip?: boolean;
+    phase?: "opening";
+  } = {},
 ): Promise<boolean> {
   if (
     !isActiveGame(game) ||
     player.isNpc ||
     !player.user ||
-    targets.length === 0
+    targets.length < (options.targetCount ?? 1)
   )
     return false;
   const menu = new StringSelectMenuBuilder()
-    .setCustomId(componentId(`night-${action}`, game))
+    .setCustomId(componentId(`${options.phase ?? "night"}-${action}`, game))
     .setPlaceholder(prompt)
     .setMinValues(options.targetCount ?? 1)
     .setMaxValues(options.targetCount ?? 1)
@@ -4890,7 +4937,7 @@ async function sendNightMenu(
       embeds: [
         new EmbedBuilder()
           .setTitle(
-            `🌙 夜の行動｜${
+            `${options.phase === "opening" ? "🌅 開始前の選択" : "🌙 夜の行動"}｜${
               (
                 {
                   kill: "襲撃",
@@ -4917,13 +4964,165 @@ async function sendNightMenu(
       ],
       components,
     });
-    if (!isActiveGame(game)) {
+    if (
+      !isActiveGame(game) ||
+      (options.phase === "opening" && game.phase !== "lobby")
+    ) {
       await message.edit({ components: [] }).catch(() => undefined);
     }
     return true;
   } catch {
     return false;
   }
+}
+
+async function finishOpeningSetup(game: GameState): Promise<void> {
+  if (
+    !isActiveGame(game) ||
+    game.phase !== "lobby" ||
+    game.day !== 1 ||
+    !game.analyticsStartedAt ||
+    game.resolving
+  )
+    return;
+  game.resolving = true;
+  game.resolutionQueued = false;
+  clearGameTimers(game);
+  for (const { player, action } of openingActors(game)) {
+    const key = nightActionKey(action, player.id);
+    if (game.nightChoices.has(key)) continue;
+    fillMissingNightAction(game, player, action);
+    if (!player.isNpc && game.nightChoices.has(key)) {
+      await sendPrivateText(
+        game,
+        player,
+        `⏱️ 開始前の自動選択\n${automaticNightNotice(game, player, action)}`,
+      );
+    }
+  }
+  try {
+    await resolveRelationshipAndUtilityActions(game);
+  } finally {
+    // 個別DMの失敗で議論開始まで止めない。
+    if (isActiveGame(game)) await startDay(game);
+  }
+}
+
+function queueOpeningCompletion(game: GameState): void {
+  if (game.resolving || game.resolutionQueued) return;
+  if (
+    !openingActors(game).every(({ player, action }) =>
+      game.nightChoices.has(nightActionKey(action, player.id)),
+    )
+  )
+    return;
+  const delayMs = remainingPhaseMinimumMs(
+    game.phaseStartedAt,
+    START_HOLD_SECONDS,
+  );
+  if (delayMs > 0) {
+    game.resolutionQueued = true;
+    schedule(game, delayMs, () => {
+      game.resolutionQueued = false;
+      return finishOpeningSetup(game);
+    });
+  } else runGameTask("Opening setup", () => finishOpeningSetup(game));
+}
+
+async function startOpeningSetup(game: GameState): Promise<void> {
+  const actors = openingActors(game);
+  if (actors.length === 0) {
+    schedule(game, START_HOLD_SECONDS * 1000, () => startDay(game));
+    return;
+  }
+  game.nightChoices.clear();
+  game.resolving = false;
+  game.resolutionQueued = false;
+  game.phaseStartedAt = Date.now();
+  game.phaseEndsAt = game.phaseStartedAt + OPENING_CHOICE_SECONDS * 1000;
+  schedule(game, OPENING_CHOICE_SECONDS * 1000, () => finishOpeningSetup(game));
+  for (const { player, action } of actors) {
+    if (player.isNpc) fillMissingNightAction(game, player, action);
+  }
+  await Promise.all(
+    actors.map(async ({ player, action }) => {
+      if (player.isNpc) return;
+      const sent = await sendNightMenu(
+        game,
+        player,
+        action,
+        action === "cupid"
+          ? "30秒以内に、恋人にする2人を選んでください。自分も選べます。"
+          : action === "devotee"
+            ? "30秒以内に、想い人を1人選んでください。"
+            : "30秒以内に、正体を確認する相手を1人選んでください。",
+        nightTargets(game, player, action),
+        { targetCount: action === "cupid" ? 2 : 1, phase: "opening" },
+      );
+      if (sent || game.phase !== "lobby" || game.resolving) return;
+      fillMissingNightAction(game, player, action);
+      queuePrivateNotice(
+        game,
+        player.id,
+        `開始前の選択DMを送れなかったため、自動選択しました。\n${automaticNightNotice(game, player, action)}`,
+      );
+    }),
+  );
+  if (isActiveGame(game) && game.phase === "lobby")
+    queueOpeningCompletion(game);
+}
+
+async function handleOpeningAction(
+  interaction: StringSelectMenuInteraction,
+  game: GameState,
+  action: OpeningAction,
+  day: number,
+): Promise<void> {
+  const actor = game.players.find(
+    (player) => player.id === interaction.user.id,
+  );
+  if (
+    game.phase !== "lobby" ||
+    game.day !== 1 ||
+    day !== 1 ||
+    !game.analyticsStartedAt ||
+    game.resolving ||
+    !actor ||
+    openingActionForPlayer(actor) !== action
+  ) {
+    await interaction.reply({
+      content: "開始前の選択は終了しました。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  const targetIds = [...new Set(interaction.values)];
+  const expectedCount = action === "cupid" ? 2 : 1;
+  const allowed = new Set(
+    nightTargets(game, actor, action).map((target) => target.id),
+  );
+  if (
+    targetIds.length !== expectedCount ||
+    targetIds.some((id) => !allowed.has(id))
+  ) {
+    await interaction.reply({
+      content: "対象を選び直してください。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  const targets = targetIds.map(
+    (id) => game.players.find((player) => player.id === id) as Player,
+  );
+  game.nightChoices.set(nightActionKey(action, actor.id), targetIds.join(","));
+  await interaction.update({
+    content:
+      action === "sorcery"
+        ? `🪄 **${safeName(targets[0])}** の正体は **${targets[0].role}** です。`
+        : `開始前の選択：**${targets.map(safeName).join("** と **")}**`,
+    components: [],
+  });
+  queueOpeningCompletion(game);
 }
 
 function activeHumanWolf(game: GameState, userId: string): Player | undefined {
@@ -5620,7 +5819,7 @@ async function sendPrivateText(
   if (!sent) queuePrivateNotice(game, player.id, text);
 }
 
-async function resolveRelationshipAndUtilityActions(
+export async function resolveRelationshipAndUtilityActions(
   game: GameState,
 ): Promise<void> {
   const choice = (action: NightAction, player: Player) =>
@@ -6852,6 +7051,12 @@ export async function handleComponent(
   else if (action === "npc-question")
     await handleNpcQuestion(interaction, game, day);
   else if (action === "vote") await handleVote(interaction, game, day);
+  else if (action === "opening-cupid")
+    await handleOpeningAction(interaction, game, "cupid", day);
+  else if (action === "opening-devotee")
+    await handleOpeningAction(interaction, game, "devotee", day);
+  else if (action === "opening-sorcery")
+    await handleOpeningAction(interaction, game, "sorcery", day);
   else if (action === "night-kill")
     await handleNightAction(interaction, game, "kill", day);
   else if (action === "night-seer")

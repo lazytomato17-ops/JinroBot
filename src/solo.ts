@@ -51,7 +51,7 @@ export function chooseNpcVoteTarget(
   suspicion: ReadonlyMap<string, number>,
   random: () => number = Math.random,
 ): string {
-  let valid = candidates.filter((candidate) => candidate.id !== actor.id);
+  let valid = knownAllySafeCandidates(actor, candidates);
   if (
     isActualWolfRole(actor.role) ||
     actor.role === "狂信者" ||
@@ -90,7 +90,7 @@ export function chooseNpcRevoteTarget(
   firstRoundCounts: ReadonlyMap<string, number>,
   random: () => number = Math.random,
 ): string {
-  let valid = candidates.filter((candidate) => candidate.id !== actor.id);
+  let valid = knownAllySafeCandidates(actor, candidates);
   if (
     isActualWolfRole(actor.role) ||
     actor.role === "狂信者" ||
@@ -137,4 +137,17 @@ export function chooseNpcRevoteTarget(
       };
     })
     .sort((left, right) => right.score - left.score)[0].id;
+}
+
+function knownAllySafeCandidates(
+  actor: Pick<Player, "id" | "role">,
+  candidates: Array<Pick<Player, "id" | "role">>,
+): Array<Pick<Player, "id" | "role">> {
+  const others = candidates.filter((candidate) => candidate.id !== actor.id);
+  if (actor.role !== "共有者") return others;
+  // 相方は最初から把握している。決選投票で相方しか残っていない場合は投票を続ける。
+  const withoutPartner = others.filter(
+    (candidate) => candidate.role !== "共有者",
+  );
+  return withoutPartner.length ? withoutPartner : others;
 }
