@@ -35,6 +35,7 @@ import {
   mediumResultRecipients,
   nightEmbed,
   nightActionForPlayer,
+  openingActionForPlayer,
   nextNpcSeerTarget,
   npcDecisionSuspicion,
   npcDiscussionSpeakers,
@@ -57,6 +58,7 @@ import {
   remainingClaimSlots,
   remainingPhaseMinimumMs,
   remainingWolfChatMessages,
+  resolveRelationshipAndUtilityActions,
   resolveWolfTarget,
   roleClaimLine,
   roleConfigPanel,
@@ -407,6 +409,15 @@ describe("ゲーム画面", () => {
     expect(componentJson).toContain("人狼 1人");
     expect(componentJson).toContain("変更する役職を選ぶ");
     expect(componentJson).toContain("狂人");
+    expect(componentJson.indexOf('"label":"🛡️ 騎士"')).toBeLessThan(
+      componentJson.indexOf('"label":"🤝 共有者"'),
+    );
+    expect(componentJson.indexOf('"label":"🤝 共有者"')).toBeLessThan(
+      componentJson.indexOf('"label":"🐾 狂信者"'),
+    );
+    expect(componentJson.indexOf('"label":"🐾 狂信者"')).toBeLessThan(
+      componentJson.indexOf('"label":"🦊 妖狐"'),
+    );
     expect(componentJson).toContain("role-increase");
     expect(componentJson).not.toContain("role-config-submit");
     expect(payload.components[1].toJSON().components[2].disabled).toBe(true);
@@ -423,7 +434,7 @@ describe("ゲーム画面", () => {
         .disabled,
     ).toBe(false);
     expect(roleConfigPanel(betaGame).embeds[0].toJSON().description).toContain(
-      "各役職の個別上限はありません",
+      "個別上限なし",
     );
 
     const oneWolfGame = makeGame([
@@ -1742,6 +1753,25 @@ describe("ゲーム画面", () => {
     expect(nightActionForPlayer(compassGame, compassGame.players[0])).toBe(
       "compass",
     );
+  });
+
+  it("キューピッド・純愛者・妖術師は初日の議論前に選択できる", async () => {
+    const game = makeGame(["キューピッド", "純愛者", "妖術師", "人狼", "村人"]);
+    expect(game.players.map(openingActionForPlayer)).toEqual([
+      "cupid",
+      "devotee",
+      "sorcery",
+      undefined,
+      undefined,
+    ]);
+    game.nightChoices.set("cupid:0", "0,4");
+    game.nightChoices.set("devotee:1", "4");
+    await resolveRelationshipAndUtilityActions(game);
+    expect(game.loverPairs).toEqual([["0", "4"]]);
+    expect(game.devoteeTargets?.get("1")).toBe("4");
+    expect(nightActionForPlayer(game, game.players[0])).toBeUndefined();
+    expect(nightActionForPlayer(game, game.players[1])).toBeUndefined();
+    expect(nightActionForPlayer(game, game.players[2])).toBe("sorcery");
   });
 
   it("NPC暗殺者は公開上の疑いが強い相手を優先して使う", () => {
