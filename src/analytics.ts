@@ -301,7 +301,7 @@ export async function recordGameCompleted(
     dayCount: number;
     durationSeconds: number;
     startedAt?: string;
-    gameplaySummary?: GameplayAnalyticsSummary;
+    gameplaySummary: GameplayAnalyticsSummary;
   },
 ): Promise<AnalyticsResult> {
   const completedAt = new Date();

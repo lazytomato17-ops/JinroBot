@@ -200,6 +200,8 @@ function addSeerResult(
   const known = results.get(seer.id) ?? [];
   if (!known.some((result) => result.targetId === target.id)) {
     known.push({ targetId: target.id, isWolf: target.role === "人狼" });
+    // 本番と同じく、初日の占いも夜の占いも妖狐を呪殺する。
+    if (target.role === "妖狐") target.alive = false;
   }
   results.set(seer.id, known);
 }
@@ -769,12 +771,8 @@ export function simulateGame(
         .filter((guarded): guarded is Player => guarded !== undefined)
         .map((guarded) => guarded.id),
     );
-    if (victim && !guardedIds.has(victim.id)) victim.alive = false;
-
-    const afterNight = getWinner(players);
-    if (afterNight) {
-      return finishResult(result, players, afterNight, day, false);
-    }
+    if (victim && victim.role !== "妖狐" && !guardedIds.has(victim.id))
+      victim.alive = false;
 
     for (const seer of players.filter(
       (player) => player.alive && player.role === "占い師",
@@ -790,6 +788,11 @@ export function simulateGame(
       if (uninspected.length) {
         addSeerResult(seerResults, seer, randomItem(uninspected, random));
       }
+    }
+
+    const afterNight = getWinner(players);
+    if (afterNight) {
+      return finishResult(result, players, afterNight, day, false);
     }
   }
 
