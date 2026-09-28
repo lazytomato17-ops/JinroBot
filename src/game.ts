@@ -6450,6 +6450,7 @@ async function endGame(game: GameState, winner: Winner): Promise<void> {
       startedAt: game.analyticsStartedAt
         ? new Date(game.analyticsStartedAt).toISOString()
         : undefined,
+      gameplaySummary: buildGameplayAnalyticsSummary(game),
     };
     queueAnalytics(game, () => recordGameCompleted(analytics));
   }

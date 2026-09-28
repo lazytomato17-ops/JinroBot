@@ -207,4 +207,29 @@ describe("自動品質テスト", () => {
       ).toBeLessThanOrEqual(0.01);
     }
   });
+
+  it("同じ10人構成では村人を2人目の妖狐に替えると妖狐勝利が増える", () => {
+    const oneFox = [
+      "人狼",
+      "狂人",
+      "占い師",
+      "騎士",
+      "霊能者",
+      "妖狐",
+      "村人",
+      "村人",
+      "村人",
+      "村人",
+    ] as const;
+    const twoFox = [
+      ...oneFox.slice(0, -1),
+      "妖狐",
+    ] as (typeof oneFox)[number][];
+    const foxWins = (roles: typeof twoFox) =>
+      Array.from({ length: 250 }, (_, index) =>
+        simulateGame([...roles], 12_345 + index * 97, 2),
+      ).filter((result) => result.winner === "fox").length;
+
+    expect(foxWins(twoFox)).toBeGreaterThan(foxWins([...oneFox]));
+  });
 });

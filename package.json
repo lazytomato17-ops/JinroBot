@@ -18,6 +18,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "playtest": "ts-node src/playtest.ts",
+    "playtest:fox": "ts-node src/playtest-fox.ts",
     "ci": "npm run typecheck && npm run lint && npm run test && npm run playtest"
   },
   "keywords": [
