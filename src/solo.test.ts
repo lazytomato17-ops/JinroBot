@@ -157,7 +157,17 @@ describe("NPC投票", () => {
     ).toBe("wolf");
     expect(
       chooseNpcVoteTarget(actor, candidates.slice(0, 1), suspicion, () => 0),
-    ).toBe("shared-b");
+    ).toBeUndefined();
+    expect(
+      chooseNpcRevoteTarget(
+        actor,
+        candidates.slice(0, 1),
+        suspicion,
+        "shared-b",
+        new Map([["shared-b", 3]]),
+        () => 0,
+      ),
+    ).toBeUndefined();
   });
 
   it("慎重派は証拠を優先し、直感派は大きく揺れる", () => {
