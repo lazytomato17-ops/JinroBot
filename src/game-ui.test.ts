@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   abandonReasonFromAction,
   abandonReasonRows,
+  allVotesSubmitted,
   applyPublicClaimSuspicion,
   autoSelectHumanSeer,
   availableClaimDays,
@@ -16,6 +17,7 @@ import {
   claimRoleRows,
   completeLoquaciousMissionForMessage,
   dayEmbed,
+  didPlayerWin,
   divisionGroupsForPlayers,
   divisionRecoverySnapshotFromTopic,
   recoverOrphanedDivisionChannels,
@@ -25,6 +27,7 @@ import {
   feedbackReasonRows,
   gameFeedbackRow,
   gameResultRow,
+  gameEndEmbed,
   gameStartEmbed,
   hasCurrentGameSession,
   hasConflictingSeerClaim,
@@ -60,6 +63,8 @@ import {
   remainingPhaseMinimumMs,
   remainingWolfChatMessages,
   resolveRelationshipAndUtilityActions,
+  resolveNightDeaths,
+  resolveLoverDeaths,
   resolveWolfTarget,
   roleClaimLine,
   roleConfigPanel,
@@ -1098,7 +1103,7 @@ describe("ゲーム画面", () => {
     expect(componentJson).not.toContain("claim-day-");
   });
 
-  it("26役職のCO選択をDiscord上限内の2メニューに分ける", () => {
+  it("共有者を除いた25役職のCO選択をDiscord上限内の2メニューに分ける", () => {
     const rows = claimRoleRows(makeGame());
     const menus = rows.map((row) => row.toJSON().components[0]);
     const options = menus.flatMap((menu) =>
@@ -1111,9 +1116,51 @@ describe("ゲーム画面", () => {
         (menu) => !("options" in menu) || (menu.options?.length ?? 0) <= 25,
       ),
     ).toBe(true);
-    expect(options).toHaveLength(26);
-    expect(options.map((option) => option.label)).toContain("共有者CO");
+    expect(options).toHaveLength(25);
+    expect(options.map((option) => option.label)).not.toContain("共有者CO");
     expect(options.map((option) => option.label)).toContain("てるてるCO");
+  });
+
+  it.each<RoleName>([
+    "人狼",
+    "狂人",
+    "狂信者",
+    "妖狐",
+    "キューピッド",
+    "純愛者",
+    "てるてる",
+  ])("%sの未CO画面は占い師COのボタンを最上段に置く", (role) => {
+    const game = makeGame([role, "占い師", "村人", "人狼"]);
+    const rows = claimPanel(game, game.players[0]).components?.map((row) =>
+      row.toJSON(),
+    );
+    expect(rows?.[0].components[0]).toMatchObject({ label: "占い師COする" });
+    expect(JSON.stringify(rows?.[0])).toContain("claim-seer-open");
+    expect(rows?.length).toBeLessThanOrEqual(5);
+  });
+
+  it("共有者は本人も騙りもCOできず、古い操作からも記録されない", () => {
+    const game = makeGame(["共有者", "共有者", "人狼", "村人"]);
+    const panel = JSON.stringify(
+      claimPanel(game, game.players[0]).components?.map((row) => row.toJSON()),
+    );
+    expect(panel).not.toContain("共有者COする");
+    expect(recordRoleDeclaration(game, game.players[0], "共有者")).toBe(false);
+    expect(recordRoleDeclaration(game, game.players[2], "共有者")).toBe(false);
+    expect(game.roleDeclarations.size).toBe(0);
+    expect(game.claimHistory).toHaveLength(0);
+  });
+
+  it("既に別役職をCOした人外は占い師COへの近道を出さない", () => {
+    const game = makeGame(["人狼", "占い師", "村人", "村人"]);
+    recordRoleDeclaration(game, game.players[0], "騎士");
+    expect(
+      JSON.stringify(
+        claimPanel(game, game.players[0]).components?.map((row) =>
+          row.toJSON(),
+        ),
+      ),
+    ).not.toContain("claim-seer-open");
   });
 
   it("CO済みなら日付選択を挟まず次の判定相手を選べる", () => {
@@ -1268,11 +1315,11 @@ describe("ゲーム画面", () => {
   });
 
   it("追加役職のCOを記録・一覧表示・取り消しできる", () => {
-    const game = makeGame(["共有者", "共有者", "人狼", "村人"]);
-    expect(recordRoleDeclaration(game, game.players[0], "共有者")).toBe(true);
-    expect(claimedRoleForPlayer(game, "0")).toBe("共有者");
-    expect(JSON.stringify(claimListEmbed(game).toJSON())).toContain("共有者");
-    expect(retractPlayerClaim(game, "0")).toBe("共有者");
+    const game = makeGame(["検死官", "共有者", "人狼", "村人"]);
+    expect(recordRoleDeclaration(game, game.players[0], "検死官")).toBe(true);
+    expect(claimedRoleForPlayer(game, "0")).toBe("検死官");
+    expect(JSON.stringify(claimListEmbed(game).toJSON())).toContain("検死官");
+    expect(retractPlayerClaim(game, "0")).toBe("検死官");
     expect(claimedRoleForPlayer(game, "0")).toBeUndefined();
   });
 
@@ -1296,7 +1343,7 @@ describe("ゲーム画面", () => {
 
   it("公開情報型の追加役職NPCは適切な日からCO候補になる", () => {
     const game = makeGame(["人狼", "共有者", "共有者", "パン屋", "市長"]);
-    expect(npcPublicRoleClaim(game, game.players[1])).toBe("共有者");
+    expect(npcPublicRoleClaim(game, game.players[1])).toBeUndefined();
     expect(npcPublicRoleClaim(game, game.players[3])).toBe("パン屋");
     expect(npcPublicRoleClaim(game, game.players[4])).toBeUndefined();
     game.day = 2;
@@ -1908,6 +1955,211 @@ describe("ゲーム画面", () => {
     expect(game.players[2].alive).toBe(false);
   });
 
+  it.each<RoleName>(["村人", "妖狐", "タフガイ", "呪われた村人", "逃亡者"])(
+    "通常襲撃で恋人が死亡すると、相方が%sでも後追いする",
+    async (partnerRole) => {
+      const game = makeGame(["人狼", "村人", partnerRole, "騎士"]);
+      game.loverPairs = [["1", "2"]];
+      game.nightChoices.set("kill:0", "1");
+      game.nightChoices.set("guard:3", "2");
+      const result = await resolveNightDeaths(game);
+      expect(result.victimId).toBe("1");
+      expect(result.deaths.map((player) => player.id)).toEqual(["1", "2"]);
+      expect(game.players[1].alive).toBe(false);
+      expect(game.players[2].alive).toBe(false);
+    },
+  );
+
+  it.each<RoleName>(["妖狐", "タフガイ", "呪われた村人", "逃亡者"])(
+    "%sが襲撃を耐えて生存した夜は恋人を後追いさせない",
+    async (role) => {
+      const game = makeGame(["人狼", role, "村人", "村人"]);
+      game.loverPairs = [["1", "2"]];
+      game.nightChoices.set("kill:0", "1");
+      game.nightChoices.set("flee:1", "3");
+      const result = await resolveNightDeaths(game);
+      expect(result.deaths).toEqual([]);
+      expect(game.players[1].alive).toBe(true);
+      expect(game.players[2].alive).toBe(true);
+    },
+  );
+
+  it("恋人の護衛が成功した夜は両方生存する", async () => {
+    const game = makeGame(["人狼", "村人", "村人", "騎士"]);
+    game.loverPairs = [["1", "2"]];
+    game.nightChoices.set("kill:0", "1");
+    game.nightChoices.set("guard:3", "1");
+    const result = await resolveNightDeaths(game);
+    expect(result.wasGuarded).toBe(true);
+    expect(result.deaths).toEqual([]);
+    expect(game.players.every((player) => player.alive)).toBe(true);
+  });
+
+  it("タフガイの恋人は傷が原因で死亡する翌夜に後追いする", async () => {
+    const game = makeGame(["人狼", "タフガイ", "村人", "村人"]);
+    game.loverPairs = [["1", "2"]];
+    game.nightChoices.set("kill:0", "1");
+    expect((await resolveNightDeaths(game)).deaths).toEqual([]);
+    game.day = 2;
+    game.nightChoices.set("kill:0", "3");
+    expect(
+      (await resolveNightDeaths(game)).deaths.map((player) => player.id),
+    ).toEqual(["3", "1", "2"]);
+  });
+
+  it("恋人の呪殺・逃亡失敗・暗殺にも後追いが適用される", async () => {
+    for (const cause of ["seer", "flee", "assassinate"] as const) {
+      const role: RoleName =
+        cause === "seer" ? "妖狐" : cause === "flee" ? "逃亡者" : "狂人";
+      const game = makeGame([
+        "人狼",
+        role,
+        "村人",
+        "村人",
+        cause === "seer" ? "占い師" : "暗殺者",
+      ]);
+      game.loverPairs = [["1", "2"]];
+      game.nightChoices.set("kill:0", "3");
+      game.nightChoices.set(
+        cause === "flee" ? "flee:1" : `${cause}:4`,
+        cause === "flee" ? "0" : "1",
+      );
+      const result = await resolveNightDeaths(game);
+      expect(result.deaths.map((player) => player.id)).toEqual(
+        expect.arrayContaining(["1", "2"]),
+      );
+      expect(game.players[1].alive).toBe(false);
+      expect(game.players[2].alive).toBe(false);
+    }
+  });
+
+  it("恋人が片方だけ死亡済みなら後追いを確定し、再適用で重複しない", () => {
+    const game = makeGame(["人狼", "村人", "妖狐", "村人"]);
+    game.loverPairs = [["1", "2"]];
+    game.players[1].alive = false;
+    const deaths: Player[] = [];
+    resolveLoverDeaths(game, deaths);
+    resolveLoverDeaths(game, deaths);
+    expect(deaths.map((player) => player.id)).toEqual(["2"]);
+    expect(game.players[2].alive).toBe(false);
+  });
+
+  it("相方しか候補がいない共有NPCは棄権し、投票完了を妨げない", () => {
+    const game = makeGame(["共有者", "共有者", "人狼", "村人"]);
+    game.phase = "voting";
+    game.voteRound = 2;
+    game.voteCandidateIds = ["0", "1"];
+    game.votes.set("0", "1");
+    game.votes.set("2", "0");
+    expect(allVotesSubmitted(game)).toBe(false);
+    game.votes.set("3", "0");
+    expect(allVotesSubmitted(game)).toBe(true);
+    expect(voteEmbed(game).toJSON().description).toContain("3 / 3");
+    game.voteCandidateIds.push("2");
+    expect(allVotesSubmitted(game)).toBe(false);
+  });
+
+  it.each([true, false])(
+    "純愛者は想い人の生死(%s)に関係なく同じ勝敗となる",
+    (alive) => {
+      const game = makeGame([
+        "純愛者",
+        "村人",
+        "人狼",
+        "妖狐",
+        "キューピッド",
+        "てるてる",
+      ]);
+      game.players[0].alive = false;
+      for (const [index, winner] of [
+        [1, "villager"],
+        [2, "wolf"],
+        [3, "fox"],
+        [4, "lovers"],
+        [5, "teruteru"],
+      ] as const) {
+        game.players[index].alive = alive;
+        game.devoteeTargets = new Map([["0", String(index)]]);
+        expect(didPlayerWin(game, game.players[0], winner)).toBe(true);
+        expect(
+          didPlayerWin(
+            game,
+            game.players[0],
+            winner === "wolf" ? "villager" : "wolf",
+          ),
+        ).toBe(false);
+      }
+    },
+  );
+
+  it("純愛の対象が恋人・別の純愛でもその勝敗に従い、循環や対象不明は勝利しない", () => {
+    const game = makeGame(["純愛者", "純愛者", "村人", "村人", "人狼"]);
+    game.devoteeTargets = new Map([
+      ["0", "1"],
+      ["1", "2"],
+    ]);
+    game.loverPairs = [["2", "3"]];
+    expect(didPlayerWin(game, game.players[0], "lovers")).toBe(true);
+    expect(didPlayerWin(game, game.players[0], "villager")).toBe(false);
+    game.devoteeTargets.set("1", "0");
+    expect(didPlayerWin(game, game.players[0], "villager")).toBe(false);
+    game.devoteeTargets.clear();
+    expect(didPlayerWin(game, game.players[0], "wolf")).toBe(false);
+    expect(roleDmEmbed(game, game.players[0]).toJSON().description).toContain(
+      "生存は条件ではありません",
+    );
+  });
+
+  it("終了画面と詳細結果には恋人の組と議論前に選んだ純愛の想い人が残る", async () => {
+    const game = makeGame(["キューピッド", "純愛者", "村人", "人狼"]);
+    game.nightChoices.set("cupid:0", "2,3");
+    game.nightChoices.set("devotee:1", "3");
+    await resolveRelationshipAndUtilityActions(game);
+    game.nightChoices.clear();
+    game.players[2].alive = false;
+    game.players[3].alive = false;
+    const end = gameEndEmbed(game, "villager").toJSON();
+    expect(
+      end.fields
+        ?.find((field) => field.name === "死亡（2人）")
+        ?.value.match(/💘/g),
+    ).toHaveLength(2);
+    for (const fields of [
+      end.fields,
+      postgameRecapEmbeds(game)[0].toJSON().fields,
+    ]) {
+      expect(fields?.find((field) => field.name === "恋人")?.value).toBe(
+        "💘 **プレイヤー2** ↔ **プレイヤー3**",
+      );
+      expect(
+        fields?.find((field) => field.name === "純愛の想い人")?.value,
+      ).toBe("💝 **プレイヤー1** → **プレイヤー3**");
+    }
+    expect(game.nightHistory).toHaveLength(0);
+  });
+
+  it("15人分の長い名前と多数の恋人・純愛関係もDiscordの表示上限に収まる", () => {
+    const game = makeGame(Array<RoleName>(15).fill("純愛者"));
+    for (const player of game.players) player.name = "_".repeat(32);
+    game.loverPairs = Array.from({ length: 7 }, (_, index) => [
+      String(index * 2),
+      String(index * 2 + 1),
+    ]);
+    game.devoteeTargets = new Map(
+      game.players.map((player, index) => [
+        player.id,
+        String((index + 1) % 15),
+      ]),
+    );
+    const end = gameEndEmbed(game, "lovers");
+    expect(end.length).toBeLessThanOrEqual(6000);
+    for (const embed of [end, ...postgameRecapEmbeds(game)]) {
+      const fields = embed.toJSON().fields ?? [];
+      expect(fields.length).toBeLessThanOrEqual(25);
+      expect(fields.every((field) => field.value.length <= 1024)).toBe(true);
+    }
+  });
+
   it("共有者と狂信者のDMには知っている仲間を表示する", () => {
     const shared = makeGame(["共有者", "共有者", "人狼", "村人"]);
     expect(
@@ -1918,6 +2170,18 @@ describe("ゲーム画面", () => {
     const description = roleDmEmbed(fanatic, fanatic.players[0]).toJSON()
       .description;
     expect(description).toContain("人狼: プレイヤー1、プレイヤー2");
+  });
+
+  it("妖狐のDMにはほかの妖狐だけを仲間として表示する", () => {
+    const game = makeGame(["妖狐", "妖狐", "妖狐", "人狼", "共有者"]);
+    const description = roleDmEmbed(game, game.players[0]).toJSON().description;
+    expect(description).toContain("仲間の妖狐: プレイヤー1、プレイヤー2");
+    expect(description).not.toContain("プレイヤー3");
+    expect(description).not.toContain("プレイヤー4");
+    const single = makeGame(["妖狐", "村人", "人狼"]);
+    expect(
+      roleDmEmbed(single, single.players[0]).toJSON().description,
+    ).not.toContain("仲間の妖狐:");
   });
 
   it("人狼会議は生存中の人間の人狼だけを仲間として扱う", () => {

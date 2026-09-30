@@ -390,24 +390,22 @@ function castBallots(
       (firstRoundCounts.get(ballot.targetId) ?? 0) + 1,
     );
   }
-  return living.map((player) => {
+  return living.flatMap((player) => {
     const valid = candidates.filter((candidate) => candidate.id !== player.id);
     const choices = valid.length ? valid : candidates;
     const suspicion = npcDecisionSuspicion(state, player);
-    return {
-      voterId: player.id,
-      targetId: firstRoundBallots
-        ? chooseNpcRevoteTarget(
-            player,
-            choices,
-            suspicion,
-            firstRoundBallots.find((ballot) => ballot.voterId === player.id)
-              ?.targetId,
-            firstRoundCounts,
-            random,
-          )
-        : chooseNpcVoteTarget(player, choices, suspicion, random),
-    };
+    const targetId = firstRoundBallots
+      ? chooseNpcRevoteTarget(
+          player,
+          choices,
+          suspicion,
+          firstRoundBallots.find((ballot) => ballot.voterId === player.id)
+            ?.targetId,
+          firstRoundCounts,
+          random,
+        )
+      : chooseNpcVoteTarget(player, choices, suspicion, random);
+    return targetId === undefined ? [] : [{ voterId: player.id, targetId }];
   });
 }
 
@@ -585,6 +583,7 @@ export function simulateGame(
       if (!choices.length) continue;
       const suspicion = npcDecisionSuspicion(state, speaker);
       const targetId = chooseNpcVoteTarget(speaker, choices, suspicion, random);
+      if (targetId === undefined) continue;
       remember(state, speaker.id, targetId, 1);
       discussionTargets.set(speaker.id, targetId);
     }

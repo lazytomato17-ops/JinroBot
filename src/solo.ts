@@ -50,8 +50,8 @@ export function chooseNpcVoteTarget(
   candidates: Array<Pick<Player, "id" | "role">>,
   suspicion: ReadonlyMap<string, number>,
   random: () => number = Math.random,
-): string {
-  let valid = knownAllySafeCandidates(actor, candidates);
+): string | undefined {
+  let valid = npcVoteCandidates(actor, candidates);
   if (
     isActualWolfRole(actor.role) ||
     actor.role === "狂信者" ||
@@ -63,7 +63,7 @@ export function chooseNpcVoteTarget(
     );
     if (nonWolves.length) valid = nonWolves;
   }
-  if (!valid.length) throw new Error("NPCの投票対象がいません。");
+  if (!valid.length) return undefined;
 
   const randomness =
     actor.npcPersonality === "直感"
@@ -89,8 +89,8 @@ export function chooseNpcRevoteTarget(
   previousTargetId: string | undefined,
   firstRoundCounts: ReadonlyMap<string, number>,
   random: () => number = Math.random,
-): string {
-  let valid = knownAllySafeCandidates(actor, candidates);
+): string | undefined {
+  let valid = npcVoteCandidates(actor, candidates);
   if (
     isActualWolfRole(actor.role) ||
     actor.role === "狂信者" ||
@@ -102,7 +102,7 @@ export function chooseNpcRevoteTarget(
     );
     if (nonWolves.length) valid = nonWolves;
   }
-  if (!valid.length) throw new Error("NPCの再投票対象がいません。");
+  if (!valid.length) return undefined;
 
   const personality = actor.npcPersonality ?? "慎重";
   const randomness =
@@ -139,15 +139,12 @@ export function chooseNpcRevoteTarget(
     .sort((left, right) => right.score - left.score)[0].id;
 }
 
-function knownAllySafeCandidates(
+export function npcVoteCandidates(
   actor: Pick<Player, "id" | "role">,
   candidates: Array<Pick<Player, "id" | "role">>,
 ): Array<Pick<Player, "id" | "role">> {
   const others = candidates.filter((candidate) => candidate.id !== actor.id);
   if (actor.role !== "共有者") return others;
-  // 相方は最初から把握している。決選投票で相方しか残っていない場合は投票を続ける。
-  const withoutPartner = others.filter(
-    (candidate) => candidate.role !== "共有者",
-  );
-  return withoutPartner.length ? withoutPartner : others;
+  // 相方しか候補に残っていない再投票でも、既知の相方には投票しない。
+  return others.filter((candidate) => candidate.role !== "共有者");
 }
