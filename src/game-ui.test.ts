@@ -2305,6 +2305,222 @@ describe("ゲーム画面", () => {
     expect(json).toContain("本当の占い結果");
   });
 
+  it.each([false, true])(
+    "人間・NPCの暗殺結果(isNpc=%s)は実際の夜処理から詳細結果へ残る",
+    async (isNpc) => {
+      const game = makeGame(["暗殺者", "人狼", "狂人", "村人"]);
+      game.players[0].isNpc = isNpc;
+      game.nightChoices.set("kill:1", "3");
+      game.nightChoices.set("assassinate:0", "2");
+      const result = await resolveNightDeaths(game);
+      expect(result.assassinationResults).toEqual([
+        {
+          actorId: "0",
+          targetId: "2",
+          outcome: "killed",
+          friendlyFire: false,
+          assassinKilled: false,
+        },
+      ]);
+      recordNightHistory(
+        game,
+        result.victimId,
+        result.wasGuarded,
+        result.deaths.map((player) => player.id),
+        result.assassinationResults,
+      );
+      game.nightChoices.clear();
+      game.players[2].role = "村人";
+      result.assassinationResults[0].outcome = "skipped";
+      const json = JSON.stringify(
+        postgameRecapEmbeds(game).map((embed) => embed.toJSON()),
+      );
+      expect(json).toContain(
+        "🗡️ 暗殺｜**とてもとてもとても長いプレイヤー名** → **プレイヤー2**｜成功：対象が死亡",
+      );
+      expect(json).not.toContain("暗殺の反動");
+      expect(json.match(/🗡️ 暗殺｜/g)).toHaveLength(1);
+    },
+  );
+
+  it("村人陣営の暗殺では暗殺者自身の死亡も詳細結果に残る", async () => {
+    const game = makeGame(["暗殺者", "人狼", "占い師", "村人"]);
+    game.nightChoices.set("kill:1", "3");
+    game.nightChoices.set("assassinate:0", "2");
+    const result = await resolveNightDeaths(game);
+    expect(result.assassinationResults[0]).toMatchObject({
+      outcome: "killed",
+      friendlyFire: true,
+      assassinKilled: true,
+    });
+    expect(game.players[0].alive).toBe(false);
+    recordNightHistory(
+      game,
+      result.victimId,
+      result.wasGuarded,
+      result.deaths.map((player) => player.id),
+      result.assassinationResults,
+    );
+    const json = JSON.stringify(
+      postgameRecapEmbeds(game).map((embed) => embed.toJSON()),
+    );
+    expect(json).toContain("成功：対象が死亡");
+    expect(json).toContain(
+      "暗殺の反動｜村人陣営への暗殺：**とてもとてもとても長いプレイヤー名** も死亡",
+    );
+  });
+
+  it("見送りは表示するが暗殺の使用回数には数えない", async () => {
+    const game = makeGame(["暗殺者", "人狼", "村人", "村人"]);
+    game.nightChoices.set("kill:1", "3");
+    game.nightChoices.set("assassinate:0", "skip");
+    const result = await resolveNightDeaths(game);
+    recordNightHistory(
+      game,
+      result.victimId,
+      result.wasGuarded,
+      result.deaths.map((player) => player.id),
+      result.assassinationResults,
+    );
+    expect(game.usedRolePowers?.has("assassinate:0") ?? false).toBe(false);
+    expect(
+      game.nightHistory[0].specialChoices?.some(
+        (choice) => choice.action === "assassinate",
+      ),
+    ).toBe(false);
+    expect(
+      JSON.stringify(postgameRecapEmbeds(game).map((embed) => embed.toJSON())),
+    ).toContain("見送り（能力未使用）");
+  });
+
+  it("襲撃と暗殺の対象が重なれば、暗殺で殺したと誤表示しない", async () => {
+    const game = makeGame(["暗殺者", "人狼", "狂人", "村人"]);
+    game.nightChoices.set("kill:1", "2");
+    game.nightChoices.set("assassinate:0", "2");
+    const result = await resolveNightDeaths(game);
+    expect(result.assassinationResults[0].outcome).toBe("already-dead");
+    recordNightHistory(
+      game,
+      result.victimId,
+      result.wasGuarded,
+      result.deaths.map((player) => player.id),
+      result.assassinationResults,
+    );
+    const json = JSON.stringify(
+      postgameRecapEmbeds(game).map((embed) => embed.toJSON()),
+    );
+    expect(json).toContain("対象は暗殺処理前に死亡済み");
+    expect(json).not.toContain("成功：対象が死亡");
+  });
+
+  it("暗殺者が同じ夜に襲撃されても確定した暗殺結果は表示する", async () => {
+    const game = makeGame(["暗殺者", "人狼", "村人", "村人"]);
+    game.nightChoices.set("kill:1", "0");
+    game.nightChoices.set("assassinate:0", "2");
+    const result = await resolveNightDeaths(game);
+    expect(result.assassinationResults[0]).toMatchObject({
+      outcome: "killed",
+      friendlyFire: true,
+      assassinKilled: false,
+    });
+    recordNightHistory(
+      game,
+      result.victimId,
+      result.wasGuarded,
+      result.deaths.map((player) => player.id),
+      result.assassinationResults,
+    );
+    expect(
+      JSON.stringify(postgameRecapEmbeds(game).map((embed) => embed.toJSON())),
+    ).toContain("は既に死亡");
+  });
+
+  it("恋人を暗殺して暗殺者も後追いした場合は反動と区別して表示する", async () => {
+    const game = makeGame(["暗殺者", "人狼", "狂人", "村人"]);
+    game.loverPairs = [["0", "2"]];
+    game.nightChoices.set("kill:1", "3");
+    game.nightChoices.set("assassinate:0", "2");
+    const result = await resolveNightDeaths(game);
+    expect(result.assassinationResults[0]).toMatchObject({
+      friendlyFire: false,
+      assassinKilled: true,
+    });
+    recordNightHistory(
+      game,
+      result.victimId,
+      result.wasGuarded,
+      result.deaths.map((player) => player.id),
+      result.assassinationResults,
+    );
+    expect(
+      JSON.stringify(postgameRecapEmbeds(game).map((embed) => embed.toJSON())),
+    ).toContain("暗殺時の後追い");
+  });
+
+  it("人狼の襲撃がなくても暗殺死亡を犠牲者なしと誤表示しない", async () => {
+    const game = makeGame(["暗殺者", "人狼", "狂人", "人狼", "村人"]);
+    game.nightChoices.set("kill:1", "0");
+    game.nightChoices.set("kill:3", "4");
+    game.nightChoices.set("assassinate:0", "2");
+    const result = await resolveNightDeaths(game);
+    recordNightHistory(
+      game,
+      result.victimId,
+      result.wasGuarded,
+      result.deaths.map((player) => player.id),
+      result.assassinationResults,
+    );
+    const json = JSON.stringify(
+      postgameRecapEmbeds(game).map((embed) => embed.toJSON()),
+    );
+    expect(json).toContain("成功：対象が死亡");
+    expect(json).toContain("襲撃による犠牲者なし");
+    expect(json).not.toContain("襲撃先がまとまらず、犠牲者なし");
+  });
+
+  it("結果情報のない旧形式でも暗殺先は消さずに表示する", () => {
+    const game = makeGame(["暗殺者", "人狼", "村人"]);
+    game.nightChoices.set("assassinate:0", "2");
+    recordNightHistory(game, undefined, false);
+    const json = JSON.stringify(
+      postgameRecapEmbeds(game).map((embed) => embed.toJSON()),
+    );
+    expect(json).toContain(
+      "🗡️ 暗殺｜**とてもとてもとても長いプレイヤー名** → **プレイヤー2**",
+    );
+    expect(json).not.toContain("成功：対象が死亡");
+  });
+
+  it("複数の暗殺者が同じ相手を狙った夜も、それぞれの結果を記録する", async () => {
+    const game = makeGame(["暗殺者", "人狼", "狂人", "暗殺者", "村人"]);
+    game.nightChoices.set("kill:1", "4");
+    game.nightChoices.set("assassinate:0", "2");
+    game.nightChoices.set("assassinate:3", "2");
+    const result = await resolveNightDeaths(game);
+    expect(
+      result.assassinationResults.map(({ actorId, outcome }) => [
+        actorId,
+        outcome,
+      ]),
+    ).toEqual([
+      ["0", "killed"],
+      ["3", "already-dead"],
+    ]);
+    recordNightHistory(
+      game,
+      result.victimId,
+      result.wasGuarded,
+      result.deaths.map((player) => player.id),
+      result.assassinationResults,
+    );
+    const json = JSON.stringify(
+      postgameRecapEmbeds(game).map((embed) => embed.toJSON()),
+    );
+    expect(json.match(/🗡️ 暗殺｜/g)).toHaveLength(2);
+    expect(json).toContain("成功：対象が死亡");
+    expect(json).toContain("対象は暗殺処理前に死亡済み");
+  });
+
   it("15人・20日分の感想戦もDiscordの表示上限内に分割する", () => {
     const roles: RoleName[] = [
       "人狼",

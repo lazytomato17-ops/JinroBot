@@ -79,11 +79,21 @@ export interface NightActionChoice {
   targetId: string;
 }
 
+export interface AssassinationResult {
+  actorId: string;
+  targetId?: string;
+  outcome: "killed" | "already-dead" | "skipped";
+  friendlyFire: boolean;
+  assassinKilled: boolean;
+}
+
 export interface NightHistoryEntry {
   day: number;
   wolfChoices: NightActionChoice[];
   guardChoices: NightActionChoice[];
   seerChoices: NightActionChoice[];
+  /** 暗殺処理時点の結果。最終的な生死や役職から死因を推測しない。 */
+  assassinationResults?: AssassinationResult[];
   specialChoices?: Array<{
     action: string;
     actorId: string;

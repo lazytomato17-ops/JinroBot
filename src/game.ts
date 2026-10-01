@@ -88,6 +88,7 @@ import {
 import { gameStatsFields, recordGameStats } from "./stats";
 import { rankingSettingsRow } from "./ranking";
 import type {
+  AssassinationResult,
   ClaimedRole,
   GameState,
   HumanArgument,
@@ -4858,6 +4859,7 @@ export function recordNightHistory(
   attackTargetId: string | undefined,
   guarded: boolean,
   deathIds: string[] = [],
+  assassinationResults?: AssassinationResult[],
 ): void {
   const choicesFor = (action: string, role: RoleName) =>
     game.players.flatMap((player) => {
@@ -4875,6 +4877,9 @@ export function recordNightHistory(
     wolfChoices,
     guardChoices: choicesFor("guard", "騎士"),
     seerChoices: choicesFor("seer", "占い師"),
+    assassinationResults: assassinationResults?.map((result) => ({
+      ...result,
+    })),
     specialChoices: [...game.nightChoices.entries()].flatMap(
       ([key, targetValue]) => {
         const separator = key.indexOf(":");
@@ -6039,6 +6044,7 @@ export async function resolveNightDeaths(game: GameState): Promise<{
   victimId: string | undefined;
   wasGuarded: boolean;
   deaths: Player[];
+  assassinationResults: AssassinationResult[];
 }> {
   const living = alivePlayers(game);
   const wolves = living.filter((player) => isActualWolfRole(player.role));
@@ -6055,6 +6061,7 @@ export async function resolveNightDeaths(game: GameState): Promise<{
   const wasGuarded = isTargetGuarded(game, victim?.id);
   const previousFatalWounds = new Set(fatalWoundIds(game));
   const deaths: Player[] = [];
+  const assassinationResults: AssassinationResult[] = [];
   await resolveRelationshipAndUtilityActions(game);
 
   let attackKilled: Player | undefined;
@@ -6106,15 +6113,34 @@ export async function resolveNightDeaths(game: GameState): Promise<{
       const target = game.players.find((player) => player.id === targetValue);
       if (target?.role === "妖狐") eliminateWithLovers(game, target, deaths);
     }
-    if (action === "assassinate" && targetValue !== "skip") {
+    if (action === "assassinate") {
       const assassin = game.players.find((player) => player.id === actorId);
+      if (!assassin) continue;
+      if (targetValue === "skip") {
+        assassinationResults.push({
+          actorId,
+          outcome: "skipped",
+          friendlyFire: false,
+          assassinKilled: false,
+        });
+        continue;
+      }
       const target = game.players.find((player) => player.id === targetValue);
-      if (!assassin || !target) continue;
+      if (!target) continue;
       usedRolePowers(game).add(powerUsedKey(action, assassin.id));
       const friendlyFire =
         target.role !== undefined && ROLE_INFO[target.role].team === "villager";
+      const targetWasAlive = target.alive;
+      const assassinWasAlive = assassin.alive;
       eliminateWithLovers(game, target, deaths);
       if (friendlyFire) eliminateWithLovers(game, assassin, deaths);
+      assassinationResults.push({
+        actorId,
+        targetId: target.id,
+        outcome: targetWasAlive ? "killed" : "already-dead",
+        friendlyFire,
+        assassinKilled: assassinWasAlive && !assassin.alive,
+      });
     }
   }
 
@@ -6150,7 +6176,7 @@ export async function resolveNightDeaths(game: GameState): Promise<{
     (player, index) =>
       deaths.findIndex((item) => item.id === player.id) === index,
   );
-  return { victimId, wasGuarded, deaths: uniqueDeaths };
+  return { victimId, wasGuarded, deaths: uniqueDeaths, assassinationResults };
 }
 
 async function revealNightResult(game: GameState): Promise<void> {
@@ -6161,12 +6187,14 @@ async function revealNightResult(game: GameState): Promise<void> {
     victimId,
     wasGuarded,
     deaths: uniqueDeaths,
+    assassinationResults,
   } = await resolveNightDeaths(game);
   recordNightHistory(
     game,
     victimId,
     wasGuarded,
     uniqueDeaths.map((player) => player.id),
+    assassinationResults,
   );
   await sendCoronerReports(game, uniqueDeaths);
 
@@ -6348,15 +6376,40 @@ function nightRecapLines(game: GameState, day: number): string[] {
     thief: "🥷 怪盗",
   };
   for (const choice of night.specialChoices ?? []) {
+    if (
+      choice.action === "assassinate" &&
+      night.assassinationResults?.some(
+        (result) => result.actorId === choice.actorId,
+      )
+    )
+      continue;
     lines.push(
       `${specialLabels[choice.action] ?? choice.action}｜**${recapPlayerName(game, choice.actorId)}** → ${choice.targetIds.map((targetId) => `**${recapPlayerName(game, targetId)}**`).join("・")}`,
     );
+  }
+  for (const result of night.assassinationResults ?? []) {
+    const actor = `**${recapPlayerName(game, result.actorId)}**`;
+    if (result.outcome === "skipped") {
+      lines.push(`🗡️ 暗殺｜${actor}｜見送り（能力未使用）`);
+      continue;
+    }
+    const target = `**${recapPlayerName(game, result.targetId ?? "")}**`;
+    lines.push(
+      `🗡️ 暗殺｜${actor} → ${target}｜${result.outcome === "killed" ? "成功：対象が死亡" : "対象は暗殺処理前に死亡済み"}`,
+    );
+    if (result.friendlyFire)
+      lines.push(
+        `暗殺の反動｜村人陣営への暗殺：${actor} ${result.assassinKilled ? "も死亡" : "は既に死亡"}`,
+      );
+    else if (result.assassinKilled)
+      lines.push(`暗殺時の後追い｜${actor} も死亡`);
   }
   for (const deathId of night.deathIds ?? []) {
     const dead = recapPlayer(game, deathId);
     if (dead) lines.push(`死亡｜**${safeName(dead)}**（${dead.role}）`);
   }
-  if (!night.attackTargetId) lines.push("結果｜襲撃先がまとまらず、犠牲者なし");
+  if (!night.attackTargetId)
+    lines.push("結果｜襲撃先がまとまらず、襲撃による犠牲者なし");
   else if (night.guarded)
     lines.push(
       `結果｜**${recapPlayerName(game, night.attackTargetId)}** への護衛成功`,
