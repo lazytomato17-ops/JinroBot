@@ -72,8 +72,10 @@ import {
   npcSeerClaimPlanStartsOnDay,
   npcDecisionSuspicion,
   npcOpinionLine,
+  npcSuspicionReason,
   personalityForSerial,
   planNpcSeerClaims,
+  takeNpcPersuasionReaction,
   isRoleClaimOverCapacity,
   roleClaimantIds,
 } from "./npc";
@@ -3879,12 +3881,9 @@ function scheduleNpcDiscussion(game: GameState, daySeconds: number): void {
       const targetId = chooseNpcVoteTarget(npc, targets, suspicion);
       const target = targets.find((candidate) => candidate.id === targetId);
       if (!target) return;
+      const reason = npcSuspicionReason(game, npc, target);
       rememberSuspect(game, npc.id, target.id, 1);
-      const line = npcOpinionLine(
-        personality,
-        safeName(target),
-        previousVoteReason(game, target.id),
-      );
+      const line = npcOpinionLine(personality, safeName(target), reason);
       await sendDiscussionMessage(
         game,
         npc,
@@ -4241,21 +4240,6 @@ export function npcQuestionLine(
   return `**${safeName(actor)}**（プレイヤー）　❓ **${safeName(npc)}**に質問\n**${safeName(npc)}**（NPC）　💬 ${answer}`;
 }
 
-function previousVoteReason(
-  game: GameState,
-  targetId: string,
-): string | undefined {
-  const records = game.voteHistory.filter(
-    (record) => record.day === game.day - 1,
-  );
-  if (records.length === 0) return undefined;
-  const latest = records.sort((left, right) => right.round - left.round)[0];
-  const count = latest.ballots.filter(
-    (ballot) => ballot.targetId === targetId,
-  ).length;
-  return count >= 2 ? `昨日も${count}票集まっていた` : undefined;
-}
-
 async function handleSuspectOpen(
   interaction: ButtonInteraction,
   game: GameState,
@@ -4549,7 +4533,13 @@ async function handleSuspectReason(
     (player) => player.id === previousArgument?.targetId,
   );
   const argument: HumanArgument = { targetId: target.id, reason };
+  const before = new Map(
+    alivePlayers(game)
+      .filter((npc) => npc.isNpc && sharesDiscussionRoom(game, actor, npc))
+      .map((npc) => [npc.id, chooseNpcQuestionAnswer(game, npc)]),
+  );
   game.humanSuspicions.set(actor.id, argument);
+  const reaction = takeNpcPersuasionReaction(game, actor.id, before);
   await interaction.update({
     content: game.divisionGroups?.has(actor.id)
       ? "意見を公開しました。同じ分断部屋の参加者とNPCに見えています。"
@@ -4567,6 +4557,30 @@ async function handleSuspectReason(
         ? { target: previousTarget, argument: previousArgument }
         : undefined,
     ),
+  );
+  if (
+    !reaction ||
+    !isActiveGame(game) ||
+    game.phase !== "day" ||
+    game.day !== day
+  )
+    return;
+  const reactingNpc = alivePlayers(game).find(
+    (npc) => npc.id === reaction.npcId,
+  );
+  if (
+    !reactingNpc ||
+    !target.alive ||
+    !sharesDiscussionRoom(game, actor, reactingNpc) ||
+    game.humanSuspicions.get(actor.id)?.targetId !== target.id ||
+    game.humanSuspicions.get(actor.id)?.reason !== reason ||
+    chooseNpcQuestionAnswer(game, reactingNpc)?.targetId !== target.id
+  )
+    return;
+  await sendDiscussionMessage(
+    game,
+    reactingNpc,
+    `**${safeName(reactingNpc)}**（NPC）　その指摘を聞いて、今は **${safeName(target)}** を疑っている。${reaction.reason}。`,
   );
 }
 

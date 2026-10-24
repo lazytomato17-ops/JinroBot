@@ -409,7 +409,7 @@ describe("NPCの推理", () => {
   it("質問には公開された人狼判定を理由として答える", () => {
     const observer = questionPlayer("レン", "村人");
     const seer = questionPlayer("ミオ", "占い師");
-    const target = questionPlayer("アカネ", "村人");
+    const target = questionPlayer("アカネ", "人狼");
     const game = questionGame([observer, seer, target]);
     game.npcSuspicion.set(target.id, 1.25);
     game.npcClaims.push({

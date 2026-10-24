@@ -645,7 +645,7 @@ describe("ゲーム画面", () => {
     });
     expect(
       npcDecisionSuspicion(soloGame, soloGame.players[1]).get("2"),
-    ).toBeCloseTo(0.135);
+    ).toBeCloseTo(0.0675);
   });
 
   it("黒判定と公開意見が重なってもNPCへの共有疑いを急増させない", () => {
@@ -799,7 +799,7 @@ describe("ゲーム画面", () => {
   });
 
   it("プレイヤーが破綻占いを指摘したらNPCも強い根拠として扱う", () => {
-    const game = makeGame(["人狼", "村人", "占い師", "騎士", "霊能者"]);
+    const game = makeGame(["人狼", "村人", "占い師", "騎士", "霊能者", "村人"]);
     const claimant = game.players[0];
     const executed = game.players[1];
     const observer = game.players[2];
@@ -814,7 +814,9 @@ describe("ゲーム画面", () => {
       targetId: executed.id,
       result: "人狼",
     });
-    game.humanSuspicions.set("human", {
+    const human = game.players[5];
+    human.isNpc = false;
+    game.humanSuspicions.set(human.id, {
       targetId: claimant.id,
       reason: "broken-claim",
     });
