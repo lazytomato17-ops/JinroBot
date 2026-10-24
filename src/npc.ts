@@ -103,17 +103,41 @@ export interface NpcQuestionAnswer {
   reason: string;
 }
 
-type NpcQuestionContext = Pick<
-  GameState,
-  | "day"
-  | "players"
-  | "roleConfig"
-  | "npcSuspicion"
-  | "humanSuspicions"
-  | "npcClaims"
-  | "voteHistory"
-  | "executionHistory"
->;
+const persuasionReplies = new WeakMap<object, Set<string>>();
+
+/** 回答が実際に変わったときだけ、1人の発言者につき1日1回反応する。 */
+export function takeNpcPersuasionReaction(
+  game: NpcDecisionContext,
+  speakerId: string,
+  before: ReadonlyMap<string, NpcQuestionAnswer | null>,
+): { npcId: string; targetId: string; reason: string } | null {
+  const argument = game.humanSuspicions.get(speakerId);
+  if (
+    !argument ||
+    argument.reason === "intuition" ||
+    !game.players.some(
+      (player) => player.id === speakerId && player.alive && !player.isNpc,
+    ) ||
+    !isHumanArgumentSupported(game, argument)
+  )
+    return null;
+  const key = `${game.day}:${speakerId}`;
+  const sent = persuasionReplies.get(game) ?? new Set<string>();
+  if (sent.has(key)) return null;
+  for (const npc of game.players) {
+    if (!npc.isNpc || !npc.alive || !before.has(npc.id)) continue;
+    const previous = before.get(npc.id);
+    const answer = chooseNpcQuestionAnswer(game, npc);
+    if (!previous?.targetId || previous.targetId === answer?.targetId) continue;
+    if (answer?.targetId !== argument.targetId) continue;
+    sent.add(key);
+    persuasionReplies.set(game, sent);
+    return { npcId: npc.id, targetId: answer.targetId, reason: answer.reason };
+  }
+  return null;
+}
+
+type NpcQuestionContext = NpcDecisionContext;
 
 type NpcDecisionContext = Pick<
   GameState,
@@ -205,6 +229,15 @@ export function claimConcernForPlayer(
 }
 
 function logicallyDisprovedSeerIds(game: HumanArgumentContext): Set<string> {
+  const initialWolfCount = Object.entries(game.roleConfig).reduce(
+    (total, [role, count]) =>
+      total + (isActualWolfRole(role as RoleName) ? count : 0),
+    0,
+  );
+  // 狼憑きは真占いでも黒。呪われた村人は試合中に人狼へ変わり得る。
+  // 配役として公開された可能性を考慮し、秘密の割当・変化は参照しない。
+  const extraBlackCapacity =
+    (game.roleConfig.狼憑き ?? 0) + (game.roleConfig.呪われた村人 ?? 0);
   const blackTargetsByClaimant = new Map<string, Set<string>>();
   for (const claim of game.npcClaims) {
     if (claim.claimedRole !== "占い師" || claim.result !== "人狼") continue;
@@ -216,9 +249,11 @@ function logicallyDisprovedSeerIds(game: HumanArgumentContext): Set<string> {
   const executedIds = new Set(game.executionHistory.map((player) => player.id));
   const disproved = new Set<string>();
   for (const [claimantId, blackTargetIds] of blackTargetsByClaimant) {
-    const tooManyBlackResults = blackTargetIds.size > game.roleConfig.人狼;
+    const tooManyBlackResults =
+      blackTargetIds.size > initialWolfCount + extraBlackCapacity;
     const executedBlackDidNotEndGame =
-      game.roleConfig.人狼 === 1 &&
+      initialWolfCount === 1 &&
+      extraBlackCapacity === 0 &&
       [...blackTargetIds].some((targetId) => executedIds.has(targetId));
     if (tooManyBlackResults || executedBlackDidNotEndGame) {
       disproved.add(claimantId);
@@ -250,20 +285,21 @@ export function credibleLoneDayOneSeerId(
 }
 
 function hasClaimVoteContradiction(
-  game: Pick<HumanArgumentContext, "npcClaims" | "voteHistory">,
+  game: Pick<HumanArgumentContext, "npcClaims" | "voteHistory" | "players">,
   speakerId: string,
 ): boolean {
-  for (const claim of game.npcClaims) {
-    if (claim.claimedRole !== "占い師" || claim.speakerId !== speakerId)
-      continue;
-    const ballot = latestBallot(game.voteHistory, claim.day, speakerId);
-    if (!ballot) continue;
-    if (claim.result === "人狼" && ballot.targetId !== claim.targetId)
-      return true;
-    if (claim.result === "人間" && ballot.targetId === claim.targetId)
-      return true;
-  }
-  return false;
+  return (
+    claimVoteInsight(
+      game.npcClaims,
+      game.voteHistory,
+      speakerId,
+      new Set(
+        game.players
+          .filter((player) => player.alive)
+          .map((player) => player.id),
+      ),
+    ) !== null
+  );
 }
 
 export function isHumanArgumentSupported(
@@ -338,11 +374,62 @@ function latestSeerResults(
   return results;
 }
 
+function argumentWeight(npc: Player, reason: HumanArgumentReason): number {
+  const personality = npc.npcPersonality ?? "慎重";
+  if (reason === "intuition") {
+    return personality === "直感" ? 1.2 : personality === "追及" ? 0.25 : 0.5;
+  }
+  if (reason === "vote-contradiction" || reason === "broken-claim") {
+    return personality === "追及" ? 1.2 : personality === "直感" ? 0.8 : 1;
+  }
+  return personality === "同調" ? 1.15 : 1;
+}
+
+/** 対抗がいるときだけ、公開された投票との矛盾でCOの信用を更新する。 */
+function addContestedClaimEvidence(
+  game: NpcDecisionContext,
+  npc: Player,
+  scores: Map<string, number>,
+): void {
+  const claimants = roleClaimantIds(game.npcClaims, "占い師");
+  const conflicts = conflictingSeerClaimantIds(game.npcClaims);
+  if (claimants.size <= game.roleConfig.占い師 && conflicts.size === 0) return;
+  const personality = npc.npcPersonality ?? "慎重";
+  const distrust =
+    personality === "追及" ? 0.8 : personality === "慎重" ? 0.65 : 0.4;
+  const corrections = new Map<string, number>();
+  for (const claimantId of claimants) {
+    if (!hasClaimVoteContradiction(game, claimantId)) continue;
+    // 偽かどうかは参照しない。白先への投票など、公開された行動だけを見る。
+    scores.set(claimantId, (scores.get(claimantId) ?? 0) + distrust * 1.5);
+    for (const [targetId, result] of latestSeerResults(
+      game.npcClaims,
+      claimantId,
+    )) {
+      const signal =
+        result === "人狼" ? PUBLIC_BLACK_CLAIM_SCORE : PUBLIC_WHITE_CLAIM_SCORE;
+      corrections.set(
+        targetId,
+        (corrections.get(targetId) ?? 0) - signal * distrust,
+      );
+    }
+  }
+  for (const [targetId, correction] of corrections) {
+    // CO人数・結果の連投で信用補正が際限なく増幅しないようにする。
+    const bounded = Math.max(
+      -PUBLIC_BLACK_CLAIM_SCORE,
+      Math.min(PUBLIC_BLACK_CLAIM_SCORE, correction),
+    );
+    scores.set(targetId, (scores.get(targetId) ?? 0) + bounded);
+  }
+}
+
 export function npcDecisionSuspicion(
   game: NpcDecisionContext,
   npc: Player,
 ): ReadonlyMap<string, number> {
   const sharedSignals = new Map(game.npcSuspicion);
+  addContestedClaimEvidence(game, npc, sharedSignals);
   const disprovedSeerIds = new Set<string>();
   const explainedDisprovedIds = new Set(
     [...game.humanSuspicions.values()]
@@ -372,7 +459,10 @@ export function npcDecisionSuspicion(
 
   const argumentScores = new Map<string, number>();
   for (const [speakerId, argument] of game.humanSuspicions) {
-    const score = humanArgumentScore(game, argument);
+    if (!game.players.some((player) => player.id === speakerId && player.alive))
+      continue;
+    const score =
+      humanArgumentScore(game, argument) * argumentWeight(npc, argument.reason);
     if (score > 0) {
       argumentScores.set(
         argument.targetId,
@@ -603,6 +693,51 @@ function latestBallot(
     .find((ballot) => ballot.voterId === voterId);
 }
 
+function claimVoteInsight(
+  claims: RoleClaim[],
+  voteHistory: VoteRecord[],
+  speakerId: string,
+  aliveIds: ReadonlySet<string>,
+): NpcInsight | null {
+  const days = new Set(
+    claims
+      .filter(
+        (claim) =>
+          claim.speakerId === speakerId && claim.claimedRole === "占い師",
+      )
+      .map((claim) => claim.day),
+  );
+  for (const day of days) {
+    const ballot = latestBallot(voteHistory, day, speakerId);
+    if (!ballot) continue;
+    const results = latestSeerResults(
+      claims.filter((claim) => claim.day <= day),
+      speakerId,
+    );
+    if (results.get(ballot.targetId) === "人間") {
+      return {
+        suspectId: speakerId,
+        reason: "人間判定を出した相手へ投票していた",
+      };
+    }
+    const round = latestVoteRound(voteHistory, day);
+    const hasAvailableBlack = [...results].some(
+      ([targetId, result]) =>
+        result === "人狼" &&
+        (aliveIds.has(targetId) ||
+          round?.ballots.some((vote) => vote.voterId === targetId)),
+    );
+    // 複数の黒先のどれかに投票した場合や、黒先が既に死亡していた場合は矛盾にしない。
+    if (hasAvailableBlack && results.get(ballot.targetId) !== "人狼") {
+      return {
+        suspectId: speakerId,
+        reason: "人狼判定を出した相手とは別の人へ投票していた",
+      };
+    }
+  }
+  return null;
+}
+
 export function findNpcInsight(
   claims: RoleClaim[],
   voteHistory: VoteRecord[],
@@ -613,22 +748,19 @@ export function findNpcInsight(
     (claim) => claim.speakerId !== observerId && aliveIds.has(claim.speakerId),
   );
 
-  for (const claim of [...visibleClaims].reverse()) {
-    if (claim.claimedRole !== "占い師") continue;
-    const ballot = latestBallot(voteHistory, claim.day, claim.speakerId);
-    if (!ballot) continue;
-    if (claim.result === "人狼" && ballot.targetId !== claim.targetId) {
-      return {
-        suspectId: claim.speakerId,
-        reason: "人狼判定を出した相手とは別の人へ投票していた",
-      };
-    }
-    if (claim.result === "人間" && ballot.targetId === claim.targetId) {
-      return {
-        suspectId: claim.speakerId,
-        reason: "人間判定を出した相手へ投票していた",
-      };
-    }
+  for (const speakerId of new Set(
+    [...visibleClaims]
+      .reverse()
+      .filter((claim) => claim.claimedRole === "占い師")
+      .map((claim) => claim.speakerId),
+  )) {
+    const insight = claimVoteInsight(
+      claims,
+      voteHistory,
+      speakerId,
+      new Set([...aliveIds, observerId]),
+    );
+    if (insight) return insight;
   }
 
   // 判定の食い違いや対抗COだけでは、どちらが偽物かは決められない。
@@ -636,15 +768,6 @@ export function findNpcInsight(
   // 本人の行動に根拠がある場合だけ疑いへ変換する。
 
   return null;
-}
-
-function addQuestionScore(
-  scores: Map<string, number>,
-  targetId: string,
-  amount: number,
-): void {
-  if (!scores.has(targetId)) return;
-  scores.set(targetId, (scores.get(targetId) ?? 0) + amount);
 }
 
 function latestVoteRound(
@@ -693,12 +816,30 @@ function questionReasonForTarget(
       (claim) =>
         claim.claimedRole === "占い師" &&
         claim.targetId === target.id &&
-        claim.result === "人狼",
+        claim.result === "人狼" &&
+        latestSeerResults(game.npcClaims, claim.speakerId).get(target.id) ===
+          "人狼" &&
+        !logicallyDisprovedSeerIds(game).has(claim.speakerId),
     );
-  if (blackClaim) return "占い師COから人狼判定が出ている";
+  if (blackClaim) {
+    const hasConflictingWhite = game.npcClaims.some(
+      (claim) =>
+        claim.claimedRole === "占い師" &&
+        claim.speakerId !== blackClaim.speakerId &&
+        latestSeerResults(game.npcClaims, claim.speakerId).get(target.id) ===
+          "人間",
+    );
+    return hasConflictingWhite
+      ? "占い判定は割れているが、人狼判定も判断材料にしている"
+      : "占い師COから人狼判定が出ている";
+  }
 
-  const opinionCount = [...game.humanSuspicions.values()].filter(
-    (argument) => argument.targetId === target.id,
+  const opinionCount = [...game.humanSuspicions.entries()].filter(
+    ([speakerId, argument]) =>
+      argument.targetId === target.id &&
+      argument.reason !== "intuition" &&
+      game.players.some((player) => player.id === speakerId && player.alive) &&
+      isHumanArgumentSupported(game, argument),
   ).length;
   if (opinionCount > 0) return `疑う意見が${opinionCount}人から出ている`;
 
@@ -720,12 +861,31 @@ function questionReasonForTarget(
   return genericQuestionReason(npc.npcPersonality ?? "慎重");
 }
 
+export function npcSuspicionReason(
+  game: NpcQuestionContext,
+  npc: Player,
+  target: Player,
+): string {
+  const insight = findNpcInsight(
+    game.npcClaims,
+    game.voteHistory,
+    npc.id,
+    new Set(
+      game.players.filter((player) => player.alive).map((player) => player.id),
+    ),
+  );
+  return questionReasonForTarget(game, npc, target, insight);
+}
+
 export function chooseNpcQuestionAnswer(
   game: NpcQuestionContext,
   npc: Player,
 ): NpcQuestionAnswer | null {
   let candidates = game.players.filter(
-    (player) => player.alive && player.id !== npc.id,
+    (player) =>
+      player.alive &&
+      player.id !== npc.id &&
+      !(npc.role === "共有者" && player.role === "共有者"),
   );
   if (
     isActualWolfRole(npc.role) ||
@@ -771,16 +931,9 @@ export function chooseNpcQuestionAnswer(
     };
   }
 
-  const scores = new Map(candidates.map((candidate) => [candidate.id, 0]));
-  for (const [targetId, score] of game.npcSuspicion)
-    addQuestionScore(scores, targetId, score);
-
-  for (const [speakerId, argument] of game.humanSuspicions) {
-    const score = humanArgumentScore(game, argument);
-    if (score > 0) addQuestionScore(scores, argument.targetId, score);
-    else addQuestionScore(scores, speakerId, 0.6);
-  }
-
+  // 質問だけ別の推理をせず、投票と同じ公開情報・個別記憶を使う。
+  // 最終投票には既存の迷いが残るため、回答は投票の確約ではない。
+  const scores = npcDecisionSuspicion(game, npc);
   const aliveIds = new Set(
     game.players.filter((player) => player.alive).map((player) => player.id),
   );
@@ -790,41 +943,11 @@ export function chooseNpcQuestionAnswer(
     npc.id,
     aliveIds,
   );
-  if (insight) addQuestionScore(scores, insight.suspectId, 4);
-
-  const previousVotes = latestVoteRound(game.voteHistory, game.day - 1);
-  for (const ballot of previousVotes?.ballots ?? [])
-    addQuestionScore(scores, ballot.targetId, 0.2);
-
-  const concernedClaimants = new Set<string>();
-  for (const role of ["占い師", "霊能者"] as const) {
-    if (!isRoleClaimOverCapacity(game, role)) continue;
-    for (const claimantId of roleClaimantIds(game.npcClaims, role))
-      concernedClaimants.add(claimantId);
-  }
-  for (const claimantId of conflictingSeerClaimantIds(game.npcClaims))
-    concernedClaimants.add(claimantId);
-  for (const claimantId of concernedClaimants)
-    addQuestionScore(scores, claimantId, 0.3);
-
-  const loneSeerId = credibleLoneDayOneSeerId(game);
-  if (
-    loneSeerId &&
-    npc.role !== undefined &&
-    ROLE_INFO[npc.role].team === "villager"
-  )
-    addQuestionScore(scores, loneSeerId, -LONE_DAY_ONE_SEER_PROTECTION);
-
-  // 狂人は人狼を知らない。日によって公開情報への逆張りで場を乱す。
-  const madmanDistorts =
-    npc.role === "狂人" && stableNpcHash(npc.id, game.day) % 100 < 55;
-  if (madmanDistorts) {
-    for (const [targetId, score] of scores) scores.set(targetId, -score * 0.35);
-  }
-
-  const highestScore = Math.max(...scores.values());
+  const highestScore = Math.max(
+    ...candidates.map((candidate) => scores.get(candidate.id) ?? 0),
+  );
   const topCandidates = candidates.filter(
-    (candidate) => scores.get(candidate.id) === highestScore,
+    (candidate) => (scores.get(candidate.id) ?? 0) === highestScore,
   );
   const target =
     topCandidates[stableCandidateIndex(npc.id, game.day, topCandidates.length)];
