@@ -37,6 +37,43 @@ describe("中断理由の保存", () => {
     vi.restoreAllMocks();
   });
 
+  it("診断ログの再送をevent_idで重複させず、DBエラー本文を表示しない", async () => {
+    const { recordDiagnosticEvents } = await import("./analytics");
+    const errorOutput = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const rows = [
+      {
+        event_id: "event",
+        session_id: "session",
+        boot_id: "boot",
+        sequence: 1,
+        occurred_at: "2026-10-25T00:00:00Z",
+        app_version: "test",
+        kind: "message",
+        day: 1,
+        phase: "day",
+        actor: "P1",
+        content: "private chat",
+        metadata: {},
+      },
+    ];
+    mocks.upsert.mockResolvedValueOnce({ error: null });
+    await expect(recordDiagnosticEvents(rows)).resolves.toEqual({
+      status: "saved",
+    });
+    expect(mocks.from).toHaveBeenCalledWith("tomatobot_game_diagnostics");
+    expect(mocks.upsert).toHaveBeenCalledWith(rows, {
+      onConflict: "event_id",
+      ignoreDuplicates: true,
+    });
+    mocks.upsert.mockResolvedValueOnce({ error: new Error("private chat") });
+    await expect(recordDiagnosticEvents(rows)).resolves.toEqual({
+      status: "failed",
+    });
+    expect(errorOutput).not.toHaveBeenCalled();
+  });
+
   it("終了済みかつ未回答のセッションへ1回だけ保存する", async () => {
     mocks.select.mockResolvedValue({ data: [{ id: "session" }], error: null });
     const { recordAbandonReason } = await import("./analytics");

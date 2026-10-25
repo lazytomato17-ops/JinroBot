@@ -56,6 +56,37 @@ export interface PlaySessionSnapshot {
 }
 
 export type AnalyticsResult = { status: "saved" | "disabled" | "failed" };
+
+export interface DiagnosticRow {
+  event_id: string;
+  session_id: string;
+  boot_id: string;
+  sequence: number;
+  occurred_at: string;
+  app_version: string;
+  kind: string;
+  day: number;
+  phase: string;
+  actor: string | null;
+  content: string | null;
+  metadata: Record<string, string | number | boolean | null>;
+}
+
+/** Private diagnostics must never echo a failed row (which may contain chat). */
+export async function recordDiagnosticEvents(
+  rows: DiagnosticRow[],
+): Promise<AnalyticsResult> {
+  try {
+    const client = analyticsClient();
+    if (!client) return { status: "disabled" };
+    const { error } = await client
+      .from("tomatobot_game_diagnostics")
+      .upsert(rows, { onConflict: "event_id", ignoreDuplicates: true });
+    return { status: error ? "failed" : "saved" };
+  } catch {
+    return { status: "failed" };
+  }
+}
 export type FeedbackResult =
   | { status: "saved"; outcome: "created" | "comment_appended" }
   | { status: "locked"; rating?: FeedbackRating }

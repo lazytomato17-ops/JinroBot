@@ -13,6 +13,10 @@ import * as dotenv from "dotenv";
 import { handleAdminAnalyticsCommand } from "./admin-analytics";
 import { recordGuildFunnelEvent } from "./analytics";
 import {
+  recordGameMessage,
+  recordGameInteractionError,
+} from "./game-diagnostics";
+import {
   createLobby,
   handleComponent,
   handleGuildMessage,
@@ -106,6 +110,12 @@ client.once(Events.ClientReady, async (readyClient) => {
 });
 
 client.on(Events.MessageCreate, handleGuildMessage);
+client.on(Events.MessageUpdate, (_oldMessage, message) => {
+  if (!message.partial) recordGameMessage(message, "edit");
+});
+client.on(Events.MessageDelete, (message) => {
+  if (!message.partial) recordGameMessage(message, "delete");
+});
 
 client.on(Events.Error, (error) => {
   console.error("Discord client error:", error);
@@ -221,6 +231,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleComponent(interaction);
     }
   } catch (error) {
+    if (interaction.guildId && interaction.channelId) {
+      recordGameInteractionError(
+        interaction.channelId,
+        interaction.user.id,
+        error,
+      );
+    }
     console.error("Interaction error:", error);
     const message = {
       content: "処理中にエラーが発生しました。",

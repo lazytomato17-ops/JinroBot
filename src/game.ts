@@ -38,6 +38,13 @@ import {
 } from "./analytics";
 import { buildGameplayAnalyticsSummary } from "./match-analytics";
 import {
+  diagnosticErrorCode,
+  finishGameDiagnostics,
+  recordGameDiagnostic,
+  recordGameMessage,
+  startGameDiagnostics,
+} from "./game-diagnostics";
+import {
   BASIC_CONFIGURABLE_ROLES,
   buildCustomRoles,
   buildRoles,
@@ -363,6 +370,10 @@ function schedule(
       Promise.resolve()
         .then(callback)
         .catch((error) => {
+          recordGameDiagnostic(game, "error", {
+            source: "scheduled_task",
+            code: diagnosticErrorCode(error),
+          });
           console.error(
             `Scheduled game task failed (day ${game.day}, ${game.phase}):`,
             error,
@@ -705,6 +716,7 @@ export async function recoverOrphanedDivisionChannels(
 }
 
 async function terminateAfterPhasePanelFailure(game: GameState): Promise<void> {
+  finishGameDiagnostics(game, "panel_failure");
   if (!isActiveGame(game)) return;
   if (!game.analyticsCompleted) {
     const startedAt = game.analyticsStartedAt;
@@ -741,6 +753,11 @@ async function openPhasePanel(
   try {
     message = await game.channel.send(payload);
   } catch (error) {
+    recordGameDiagnostic(game, "error", {
+      source: "phase_panel",
+      code: diagnosticErrorCode(error),
+    });
+    finishGameDiagnostics(game, "panel_failure");
     console.error(
       `Phase panel send failed (day ${game.day}, ${game.phase}):`,
       error,
@@ -763,6 +780,9 @@ async function openPhasePanel(
     return false;
   }
   game.phaseMessage = message;
+  recordGameDiagnostic(game, "phase_panel", {
+    phase_ends_at: game.phaseEndsAt ?? null,
+  });
   return true;
 }
 
@@ -1861,6 +1881,7 @@ export async function resetChannel(
   const wasInProgress = Boolean(
     game.analyticsStartedAt && game.phase !== "ended",
   );
+  finishGameDiagnostics(game, "reset");
   clearGameTimers(game);
   await restoreDivisionChannels(game, "ゲーム終了による分断解除").catch(
     (error) => console.error("Division cleanup during reset failed:", error),
@@ -2634,6 +2655,8 @@ async function startGame(game: GameState): Promise<void> {
   }
 
   game.roleDmFailures.clear();
+  analyticsSnapshot(game);
+  startGameDiagnostics(game);
   try {
     if (!game.lobbyMessage) throw new Error("Lobby message is unavailable.");
     await game.lobbyMessage.edit({
@@ -2642,6 +2665,11 @@ async function startGame(game: GameState): Promise<void> {
       components: [],
     });
   } catch (error) {
+    recordGameDiagnostic(game, "error", {
+      source: "start_panel",
+      code: diagnosticErrorCode(error),
+    });
+    finishGameDiagnostics(game, "panel_failure");
     if (canDiscardPreparedRoles) {
       game.players = game.players
         .filter((player) => !player.isNpc)
@@ -2678,6 +2706,9 @@ async function startGame(game: GameState): Promise<void> {
   if (games.get(game.channelId) !== game) return;
 
   if (game.roleDmFailures.size > 0) {
+    recordGameDiagnostic(game, "role_dm_failed", {
+      count: game.roleDmFailures.size,
+    });
     await game.lobbyMessage?.edit({ content: "", ...lobbyPayload(game) });
     return;
   }
@@ -4070,6 +4101,7 @@ export function completeLoquaciousMissionForMessage(
 }
 
 export async function handleGuildMessage(message: Message): Promise<void> {
+  recordGameMessage(message);
   if (!message.inGuild() || message.author.bot) return;
   const game = gameForChannelId(message.channelId);
   if (game?.channel.guildId !== message.guildId) return;
@@ -6644,11 +6676,13 @@ export function gameEndEmbed(game: GameState, winner: Winner): EmbedBuilder {
 
 async function endGame(game: GameState, winner: Winner): Promise<void> {
   if (!isActiveGame(game)) return;
+  recordGameDiagnostic(game, "result", { winner });
   clearGameTimers(game);
   await restoreDivisionChannels(game, "ゲーム終了による分断解除").catch(
     (error) => console.error("Division cleanup during game end failed:", error),
   );
   game.phase = "ended";
+  finishGameDiagnostics(game, "completed");
   if (!game.analyticsCompleted) {
     game.analyticsCompleted = true;
     const analytics = {
@@ -7131,6 +7165,19 @@ export async function handleComponent(
       flags: MessageFlags.Ephemeral,
     });
     return;
+  }
+
+  // Record receipt, not success: never persist private form values or targets.
+  if (
+    interaction.guildId &&
+    interaction.guildId === game.channel.guildId &&
+    game.players.some(
+      (player) => !player.isNpc && player.id === interaction.user.id,
+    )
+  ) {
+    recordGameDiagnostic(game, "interaction_received", {
+      action: action.replace(/[^a-z-]/g, "").slice(0, 48),
+    });
   }
 
   if (interaction.isModalSubmit()) {
