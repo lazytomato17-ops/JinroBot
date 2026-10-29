@@ -13,7 +13,9 @@ import {
   npcSeerClaimPlanStartsOnDay,
   personalityForSerial,
   planNpcSeerClaims,
+  chooseStrategicNightTarget,
 } from "./npc";
+import { chooseNpcVoteTarget, chooseNpcRevoteTarget } from "./solo";
 import type { GameState, Player } from "./types";
 
 type QuestionGame = Pick<
@@ -117,6 +119,79 @@ function questionGame(players: Player[]): QuestionGame {
     executionHistory: [],
   };
 }
+
+describe("NPCの非公開情報に対する公平性", () => {
+  it.each(["村人", "騎士", "霊能者"] as const)(
+    "%s NPCは他人の真の役職を入れ替えても推理・質問・投票を変えない",
+    (role) => {
+      const observer = questionPlayer("observer", role);
+      const first = questionPlayer("a", "人狼", false);
+      const second = questionPlayer("b", "村人", false);
+      const seer = questionPlayer("seer", "占い師");
+      const g = questionGame([observer, first, second, seer]);
+      g.day = 2;
+      g.npcClaims.push({
+        speakerId: "seer",
+        claimedRole: "占い師",
+        targetId: "a",
+        result: "人狼",
+        day: 2,
+      });
+      const before = npcDecisionSuspicion(g, observer);
+      const answer = chooseNpcQuestionAnswer(g, observer);
+      const targets = [first, second, seer];
+      const vote = chooseNpcVoteTarget(observer, targets, before, () => 0.4);
+      const revote = chooseNpcRevoteTarget(
+        observer,
+        targets,
+        before,
+        "b",
+        new Map(),
+        () => 0.4,
+      );
+      first.role = "村人";
+      second.role = "人狼";
+      const after = npcDecisionSuspicion(g, observer);
+      expect([...after]).toEqual([...before]);
+      expect(chooseNpcQuestionAnswer(g, observer)).toEqual(answer);
+      expect(chooseNpcVoteTarget(observer, targets, after, () => 0.4)).toBe(
+        vote,
+      );
+      expect(
+        chooseNpcRevoteTarget(
+          observer,
+          targets,
+          after,
+          "b",
+          new Map(),
+          () => 0.4,
+        ),
+      ).toBe(revote);
+    },
+  );
+
+  it("襲撃・護衛の優先度は真の役職ではなく公開COに基づく", () => {
+    const first = questionPlayer("a", "占い師", false);
+    const second = questionPlayer("b", "村人", false);
+    for (const action of ["kill", "guard"] as const) {
+      const before = chooseStrategicNightTarget(
+        action,
+        [first, second],
+        () => undefined,
+        () => 0.4,
+      )?.id;
+      [first.role, second.role] = [second.role, first.role];
+      expect(
+        chooseStrategicNightTarget(
+          action,
+          [first, second],
+          () => undefined,
+          () => 0.4,
+        )?.id,
+      ).toBe(before);
+    }
+  });
+});
 
 describe("NPCの性格", () => {
   it("NPCごとに固定の性格を割り当てる", () => {

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { MessageFlags } from "discord.js";
 import {
   analyticsAppVersion,
   recordDiagnosticEvents,
@@ -111,10 +112,15 @@ interface Recording {
   seen: Map<string, string>;
   lastPhase: string;
   endedAt?: number;
+  endedDay?: number;
+  participantAliases: Map<string, string>;
   timer: ReturnType<typeof setInterval>;
 }
 const recordings = new Map<string, Recording>();
-const lastSequences = new WeakMap<GameState, number>();
+const lastSequences = new WeakMap<
+  GameState,
+  { sessionId: string; sequence: number }
+>();
 
 function emit(
   recording: Recording,
@@ -123,7 +129,10 @@ function emit(
   actor: string | null = null,
   content: string | null = null,
 ): void {
-  lastSequences.set(recording.game, recording.sequence + 1);
+  lastSequences.set(recording.game, {
+    sessionId: recording.sessionId,
+    sequence: recording.sequence + 1,
+  });
   buffer.push({
     event_id: randomUUID(),
     session_id: recording.sessionId,
@@ -132,7 +141,7 @@ function emit(
     occurred_at: new Date().toISOString(),
     app_version: analyticsAppVersion(),
     kind,
-    day: recording.game.day,
+    day: recording.endedDay ?? recording.game.day,
     phase: recording.endedAt === undefined ? recording.game.phase : "ended",
     actor,
     content,
@@ -146,7 +155,11 @@ export function recordGameDiagnostic(
   metadata: Metadata = {},
 ): void {
   const recording = recordings.get(game.channelId);
-  if (recording?.game !== game) return;
+  if (
+    recording?.game !== game ||
+    recording.sessionId !== game.analyticsSessionId
+  )
+    return;
   if (
     recording.endedAt !== undefined &&
     Date.now() >= recording.endedAt + POSTGAME_LOG_MS
@@ -170,19 +183,29 @@ function snapshot(recording: Recording): void {
   recording.lastPhase = phase;
 }
 
-/** A rematch owns a new state/session; close the previous postgame window first. */
+/** Rematches mutate GameState in place; session ID, not object identity, is the boundary. */
 export function startGameDiagnostics(game: GameState): void {
   if (!game.analyticsSessionId) return;
   const previous = recordings.get(game.channelId);
-  if (previous?.game === game) return;
+  if (previous?.game === game && previous.sessionId === game.analyticsSessionId)
+    return;
   if (previous) close(previous, "next_game");
+  const previousSequence = lastSequences.get(game);
   const recording: Recording = {
     game,
     sessionId: game.analyticsSessionId,
-    sequence: lastSequences.get(game) ?? 0,
+    sequence:
+      previousSequence?.sessionId === game.analyticsSessionId
+        ? previousSequence.sequence
+        : 0,
     messages: 0,
     seen: new Map(),
     lastPhase: "",
+    participantAliases: new Map(
+      game.players.flatMap((player, index) =>
+        player.isNpc ? [] : [[player.id, `P${index + 1}`] as const],
+      ),
+    ),
     timer: setInterval(() => {
       if (recording.endedAt !== undefined) {
         if (Date.now() >= recording.endedAt + POSTGAME_LOG_MS)
@@ -211,14 +234,21 @@ export function finishGameDiagnostics(
   reason: "completed" | "reset" | "panel_failure",
 ): void {
   const recording = recordings.get(game.channelId);
-  if (recording?.game !== game) return;
+  if (
+    recording?.game !== game ||
+    recording.sessionId !== game.analyticsSessionId
+  )
+    return;
   if (recording.endedAt !== undefined) {
     if (reason !== "completed") close(recording, reason);
     return;
   }
   emit(recording, "finish", { reason });
   if (reason !== "completed") close(recording, reason);
-  else recording.endedAt = Date.now();
+  else {
+    recording.endedAt = Date.now();
+    recording.endedDay = game.day;
+  }
 }
 
 export interface DiagnosticMessage {
@@ -233,6 +263,7 @@ export interface DiagnosticMessage {
     fields?: readonly { name: string; value: string }[];
   }[];
   editedTimestamp?: number | null;
+  flags?: { has(flag: number): boolean };
   client: { user: { id: string } | null };
 }
 
@@ -241,7 +272,12 @@ export function recordGameMessage(
   message: DiagnosticMessage,
   operation: "create" | "edit" | "delete" = "create",
 ): void {
-  if (!message.guildId || !message.author) return;
+  if (
+    !message.guildId ||
+    !message.author ||
+    message.flags?.has(MessageFlags.Ephemeral)
+  )
+    return;
   for (const recording of recordings.values()) {
     const { game } = recording;
     if (game.channel.guildId !== message.guildId) continue;
@@ -265,10 +301,8 @@ export function recordGameMessage(
       message.author.bot && message.author.id === message.client.user?.id;
     // After a match, collect participant feedback only, not a new lobby's bot UI.
     if (ownBot && recording.endedAt !== undefined) return;
-    const playerIndex = game.players.findIndex(
-      (player) => !player.isNpc && player.id === message.author?.id,
-    );
-    if (!ownBot && (message.author.bot || playerIndex < 0)) return;
+    const actorAlias = recording.participantAliases.get(message.author.id);
+    if (!ownBot && (message.author.bot || !actorAlias)) return;
     const raw = ownBot
       ? [
           message.content ?? "",
@@ -299,7 +333,7 @@ export function recordGameMessage(
         truncated: raw.length > 4000,
         content_unavailable: operation !== "delete" && raw.length === 0,
       },
-      ownBot ? "BOT" : `P${playerIndex + 1}`,
+      ownBot ? "BOT" : actorAlias!,
       content,
     );
     if (recording.messages === MAX_MESSAGES)
@@ -321,12 +355,7 @@ export function recordGameInteractionError(
       )
     )
       continue;
-    if (
-      !recording.game.players.some(
-        (player) => !player.isNpc && player.id === userId,
-      )
-    )
-      return;
+    if (!recording.participantAliases.has(userId)) return;
     recordGameDiagnostic(recording.game, "error", {
       source: "interaction",
       code: diagnosticErrorCode(error),

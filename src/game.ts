@@ -532,6 +532,66 @@ async function sendDiscussionMessage(
   return divisionChannelForPlayer(game, speaker).send(content);
 }
 
+interface NpcResultPublication {
+  role: "占い師" | "霊能者";
+  target: Player;
+  result: PublicResult;
+  resultDay: number;
+  memoryScore?: number;
+  shareSuspicion?: boolean;
+}
+
+/** Do not let NPCs reason from a CO that Discord never actually published. */
+export async function publishNpcResults(
+  game: GameState,
+  speaker: Player,
+  results: NpcResultPublication[],
+): Promise<void> {
+  const sessionId = game.analyticsSessionId;
+  const staged = {
+    ...game,
+    npcClaims: [...game.npcClaims],
+    claimHistory: [...game.claimHistory],
+  };
+  const initialClaims = staged.npcClaims.length;
+  const initialHistory = staged.claimHistory.length;
+  const accepted = results.filter((entry) =>
+    recordRoleClaim(
+      staged,
+      speaker,
+      entry.role,
+      entry.target,
+      entry.result,
+      entry.resultDay,
+    ),
+  );
+  if (!accepted.length) return;
+  await sendDiscussionMessage(
+    game,
+    speaker,
+    accepted
+      .map((entry) =>
+        roleClaimLine(
+          speaker,
+          entry.role,
+          entry.target,
+          entry.result,
+          entry.resultDay,
+        ),
+      )
+      .join("\n"),
+  );
+  if (game.analyticsSessionId !== sessionId) return;
+  game.npcClaims.push(...staged.npcClaims.slice(initialClaims));
+  game.claimHistory.push(...staged.claimHistory.slice(initialHistory));
+  for (const entry of accepted) {
+    if (entry.memoryScore !== undefined)
+      rememberSuspect(game, speaker.id, entry.target.id, entry.memoryScore);
+    if (entry.shareSuspicion)
+      applyPublicClaimSuspicion(game, entry.target, entry.result);
+  }
+}
+
 async function restoreDivisionChannels(
   game: GameState,
   reason: string,
@@ -1458,9 +1518,20 @@ export function nightEmbed(game: GameState): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle(`${game.day}日目｜夜`)
     .setDescription(
-      `能力者はDMを確認してください。\n全員の行動が終わると、夜が明けます。\n\n夜明け：${relativeTime(game.phaseEndsAt)}`,
+      `夜の操作がある人はDMで選択してください。\n操作のない人・選択済みの人は、そのままお待ちください。\n全員の選択完了か締切で、自動的に進行します。\n\n夜明けの締切：${relativeTime(game.phaseEndsAt)}`,
     )
     .setColor(COLORS.night);
+}
+
+export function morningEmbed(
+  game: GameState,
+  description: string,
+  hasDeaths: boolean,
+): EmbedBuilder {
+  return new EmbedBuilder()
+    .setTitle(`${game.day + 1}日目｜朝`)
+    .setDescription(description)
+    .setColor(hasDeaths ? COLORS.danger : COLORS.success);
 }
 
 function createNpc(game: GameState): Player {
@@ -3756,46 +3827,32 @@ function scheduleNpcDiscussion(game: GameState, daySeconds: number): void {
       const knownResults =
         npc.role === "占い師" ? availableTrueSeerClaims(game, npc) : [];
       if (knownResults.length > 0) {
-        const publishedLines: string[] = [];
-        for (const { day: resultDay, target, result } of knownResults) {
-          if (!recordRoleClaim(game, npc, "占い師", target, result, resultDay))
-            continue;
-          rememberSuspect(game, npc.id, target.id, result === "人狼" ? 6 : -3);
-          applyPublicClaimSuspicion(game, target, result);
-          publishedLines.push(
-            roleClaimLine(npc, "占い師", target, result, resultDay),
-          );
-        }
-        if (publishedLines.length > 0)
-          await sendDiscussionMessage(game, npc, publishedLines.join("\n"));
+        await publishNpcResults(
+          game,
+          npc,
+          knownResults.map(({ day, target, result }) => ({
+            role: "占い師",
+            target,
+            result,
+            resultDay: day,
+            memoryScore: result === "人狼" ? 6 : -3,
+            shareSuspicion: true,
+          })),
+        );
         return;
       }
 
       if (npc.role === "霊能者" && game.lastExecuted) {
         const resultText = publicResultForRole(game.lastExecuted.role);
         const resultDay = game.executionHistory.length;
-        if (
-          !recordRoleClaim(
-            game,
-            npc,
-            "霊能者",
-            game.lastExecuted,
-            resultText,
+        await publishNpcResults(game, npc, [
+          {
+            role: "霊能者",
+            target: game.lastExecuted,
+            result: resultText,
             resultDay,
-          )
-        )
-          return;
-        await sendDiscussionMessage(
-          game,
-          npc,
-          roleClaimLine(
-            npc,
-            "霊能者",
-            game.lastExecuted,
-            resultText,
-            resultDay,
-          ),
-        );
+          },
+        ]);
         return;
       }
 
@@ -3827,14 +3884,21 @@ function scheduleNpcDiscussion(game: GameState, daySeconds: number): void {
           npc.id,
           isContinuingSeerClaim,
         );
-        const publishedLines: string[] = [];
+        const publications: NpcResultPublication[] = [];
         for (const resultDay of claimDays) {
           const availableFakeTargets =
             npc.role !== "狂人"
               ? targets.filter((target) => !isActualWolfRole(target.role))
               : targets;
           const claimedTargetIds = new Set(
-            game.npcClaims
+            [
+              ...game.npcClaims,
+              ...publications.map((entry) => ({
+                speakerId: npc.id,
+                claimedRole: entry.role,
+                targetId: entry.target.id,
+              })),
+            ]
               .filter(
                 (claim) =>
                   claim.speakerId === npc.id && claim.claimedRole === "占い師",
@@ -3850,34 +3914,30 @@ function scheduleNpcDiscussion(game: GameState, daySeconds: number): void {
               ? availableFakeTargets
               : targets;
           const target = randomItem(fakeTargets);
-          const earlierResult = game.npcClaims.find(
-            (claim) =>
-              claim.speakerId === npc.id &&
-              claim.claimedRole === "占い師" &&
-              claim.targetId === target.id,
-          )?.result;
+          const earlierResult =
+            publications.find((entry) => entry.target.id === target.id)
+              ?.result ??
+            game.npcClaims.find(
+              (claim) =>
+                claim.speakerId === npc.id &&
+                claim.claimedRole === "占い師" &&
+                claim.targetId === target.id,
+            )?.result;
           const fakeResult: PublicResult =
             earlierResult ??
             (npc.role === "狂人" && Math.random() < MADMAN_WHITE_CLAIM_CHANCE
               ? "人間"
               : "人狼");
-          if (
-            !recordRoleClaim(game, npc, "占い師", target, fakeResult, resultDay)
-          )
-            continue;
-          rememberSuspect(
-            game,
-            npc.id,
-            target.id,
-            fakeResult === "人狼" ? 2 : -1,
-          );
-          applyPublicClaimSuspicion(game, target, fakeResult);
-          publishedLines.push(
-            roleClaimLine(npc, "占い師", target, fakeResult, resultDay),
-          );
+          publications.push({
+            role: "占い師",
+            target,
+            result: fakeResult,
+            resultDay,
+            memoryScore: fakeResult === "人狼" ? 2 : -1,
+            shareSuspicion: true,
+          });
         }
-        if (publishedLines.length > 0)
-          await sendDiscussionMessage(game, npc, publishedLines.join("\n"));
+        await publishNpcResults(game, npc, publications);
         return;
       }
 
@@ -6256,12 +6316,7 @@ async function revealNightResult(game: GameState): Promise<void> {
           : "昨夜の犠牲者はいませんでした。";
   if (
     !(await updateOrReplacePhasePanel(game, {
-      embeds: [
-        new EmbedBuilder()
-          .setTitle(`${game.day}日目｜朝`)
-          .setDescription(morningDescription)
-          .setColor(uniqueDeaths.length === 0 ? COLORS.success : COLORS.danger),
-      ],
+      embeds: [morningEmbed(game, morningDescription, uniqueDeaths.length > 0)],
       components: [],
     }))
   )
