@@ -17,6 +17,35 @@ vi.mock("@supabase/supabase-js", () => ({
 }));
 
 describe("中断理由の保存", () => {
+  it("感想分類と募集時点の体験情報を専用RPCへ送り、生IDは送らない", async () => {
+    process.env.TOMATOBOT_ANALYTICS_HMAC_SECRET = "analytics-test-secret";
+    mocks.rpc.mockResolvedValue({
+      data: [{ outcome: "created", locked_rating: "issue" }],
+      error: null,
+    });
+    const { recordMatchFeedback } = await import("./analytics");
+    expect(
+      await recordMatchFeedback({
+        sessionId: "session",
+        userId: "123456789012345678",
+        rating: "issue",
+        reason: "npc",
+        npcDetail: "unfair",
+        experience: { role: "村人", humans: 1, npcs: 6, profile: "basic" },
+      }),
+    ).toEqual({ status: "saved", outcome: "created" });
+    expect(mocks.rpc).toHaveBeenCalledWith(
+      "tomatobot_submit_experience_feedback",
+      expect.objectContaining({
+        p_npc_detail: "unfair",
+        p_context: { role: "村人", humans: 1, npcs: 6, profile: "basic" },
+        p_participant_hash: expect.stringMatching(/^v1:[0-9a-f]{64}$/),
+      }),
+    );
+    expect(JSON.stringify(mocks.rpc.mock.calls)).not.toContain(
+      "123456789012345678",
+    );
+  });
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();

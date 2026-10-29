@@ -40,6 +40,11 @@ import {
   nightEmbed,
   morningEmbed,
   publishNpcResults,
+  publishRoleDeclaration,
+  publishClaimRetraction,
+  publishHumanArgument,
+  npcFeedbackDetailRows,
+  decisionRecapLines,
   nightActionForPlayer,
   openingActionForPlayer,
   nextNpcSeerTarget,
@@ -141,6 +146,110 @@ function enableBetaHost(game: GameState): void {
 }
 
 describe("ゲーム画面", () => {
+  it("CO連打は1回だけ送信し、夜には送らない", async () => {
+    const game = makeGame();
+    let sent!: (value: unknown) => void;
+    const send = vi.fn().mockReturnValue(
+      new Promise((resolve) => {
+        sent = resolve;
+      }),
+    );
+    game.channel = { send } as unknown as TextChannel;
+    const entry = {
+      role: "占い師" as const,
+      target: game.players[0],
+      result: "人狼" as const,
+      resultDay: 1,
+    };
+    const first = publishNpcResults(game, game.players[1], [entry]);
+    expect(await publishNpcResults(game, game.players[1], [entry])).toBe(0);
+    sent({ id: "ok" });
+    expect(await first).toBe(1);
+    expect(send).toHaveBeenCalledTimes(1);
+    game.phase = "night";
+    expect(await publishNpcResults(game, game.players[1], [entry])).toBe(0);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+  it("通常COと取り消しも送信失敗では公開情報を変更しない", async () => {
+    const game = makeGame();
+    game.channel = {
+      send: vi.fn().mockRejectedValue(new Error("network")),
+    } as unknown as TextChannel;
+    await expect(
+      publishRoleDeclaration(game, game.players[0], "村人"),
+    ).rejects.toThrow("network");
+    expect(claimedRoleForPlayer(game, "0")).toBeUndefined();
+    recordRoleDeclaration(game, game.players[0], "村人");
+    await expect(publishClaimRetraction(game, game.players[0])).rejects.toThrow(
+      "network",
+    );
+    expect(claimedRoleForPlayer(game, "0")).toBe("村人");
+    game.channel = {
+      send: vi.fn().mockResolvedValue({ id: "ok" }),
+    } as unknown as TextChannel;
+    expect(await publishClaimRetraction(game, game.players[0])).toBe("村人");
+    expect(claimedRoleForPlayer(game, "0")).toBeUndefined();
+  });
+  it("擁護意見も送信成功後だけ反映し、同じ人の意見を積み増さない", async () => {
+    const game = makeGame();
+    game.channel = {
+      send: vi.fn().mockRejectedValue(new Error("network")),
+    } as unknown as TextChannel;
+    await expect(
+      publishHumanArgument(
+        game,
+        game.players[0],
+        game.players[2],
+        "white-defense",
+      ),
+    ).rejects.toThrow("network");
+    expect(game.humanSuspicions.size).toBe(0);
+    game.channel = {
+      send: vi.fn().mockResolvedValue({ id: "ok" }),
+    } as unknown as TextChannel;
+    await publishHumanArgument(
+      game,
+      game.players[0],
+      game.players[2],
+      "white-defense",
+    );
+    await publishHumanArgument(
+      game,
+      game.players[0],
+      game.players[3],
+      "intuition",
+    );
+    expect(game.humanSuspicions.size).toBe(1);
+    expect(game.humanSuspicions.get("0")?.targetId).toBe("3");
+    expect(game.humanArgumentEffects).toHaveLength(2);
+  });
+  it("NPC投票の理由は投票時点の値を保持する", () => {
+    const game = makeGame();
+    game.votes.set("1", "0");
+    const explanation = {
+      voterId: "1",
+      targetId: "0",
+      reason: "公開された黒判定",
+      personality: "慎重",
+    };
+    game.npcVoteExplanations = new Map([["1", explanation]]);
+    recordCurrentVoteRound(game);
+    explanation.reason = "後から変えた理由";
+    expect(game.voteHistory[0].npcExplanations?.[0].reason).toBe(
+      "公開された黒判定",
+    );
+    expect(decisionRecapLines(game).join("\n")).toContain("1");
+  });
+  it("NPC感想の詳細は既存導線内の5択で、ID上限を超えない", () => {
+    const game = makeGame();
+    game.analyticsChainId = "01234567-0123-0123-0123-012345678901";
+    const rows = npcFeedbackDetailRows(game, "issue").map((r) => r.toJSON());
+    expect(rows).toHaveLength(1);
+    expect(rows[0].components).toHaveLength(5);
+    expect(
+      rows[0].components.every((c) => (c.custom_id?.length ?? 101) <= 100),
+    ).toBe(true);
+  });
   it("DiscordへCOを送れない場合は、NPCの公開情報・疑い・履歴を増やさない", async () => {
     const game = makeGame();
     game.channel = {
@@ -440,6 +549,9 @@ describe("ゲーム画面", () => {
     game.players[0].isNpc = false;
     game.players[0].alive = false;
     game.votes.set("0", "1");
+    game.analyticsFeedbackContextByUserId = new Map([
+      ["0", { role: "村人", humans: 1, npcs: 3, profile: "basic" }],
+    ]);
 
     const rematch = prepareRematchGame(
       game,
@@ -461,6 +573,14 @@ describe("ゲーム画面", () => {
     );
     expect(rematch.analyticsChainId).toBe(game.analyticsChainId);
     expect(rematch.votes.size).toBe(0);
+    expect(rematch.analyticsFeedbackContextByUserId?.get("0")).toEqual({
+      role: "村人",
+      humans: 1,
+      npcs: 3,
+      profile: "basic",
+    });
+    expect(rematch.humanArgumentEffects).toEqual([]);
+    expect(rematch.npcVoteExplanations?.size).toBe(0);
   });
 
   it("DM失敗の公開警告から対象者と役職を特定できない", () => {
@@ -2100,6 +2220,21 @@ describe("ゲーム画面", () => {
     expect(result.deaths).toEqual([]);
     expect(game.players.every((player) => player.alive)).toBe(true);
   });
+
+  it.each<RoleName>(["村人", "妖狐", "タフガイ", "呪われた村人", "逃亡者"])(
+    "恋人の%sを複数騎士が同時護衛しても死亡・後追いを起こさない",
+    async (role) => {
+      const game = makeGame(["人狼", role, "村人", "騎士", "騎士"]);
+      game.loverPairs = [["1", "2"]];
+      game.nightChoices.set("kill:0", "1");
+      game.nightChoices.set("guard:3", "1");
+      game.nightChoices.set("guard:4", "1");
+      if (role === "逃亡者") game.nightChoices.set("flee:1", "2");
+      const result = await resolveNightDeaths(game);
+      expect(result.deaths).toEqual([]);
+      expect(game.players[1].alive && game.players[2].alive).toBe(true);
+    },
+  );
 
   it("タフガイの恋人は傷が原因で死亡する翌夜に後追いする", async () => {
     const game = makeGame(["人狼", "タフガイ", "村人", "村人"]);

@@ -38,6 +38,11 @@ import {
 } from "./analytics";
 import { buildGameplayAnalyticsSummary } from "./match-analytics";
 import {
+  experienceContext,
+  NPC_FEEDBACK_DETAILS,
+  type NpcFeedbackDetail,
+} from "./experience";
+import {
   diagnosticErrorCode,
   finishGameDiagnostics,
   recordGameDiagnostic,
@@ -75,6 +80,7 @@ import {
   chooseStrategicNightTarget,
   findNpcInsight,
   HUMAN_ARGUMENT_REASONS,
+  isHumanArgumentSupported,
   MADMAN_WHITE_CLAIM_CHANCE,
   npcSeerClaimPlanStartsOnDay,
   npcDecisionSuspicion,
@@ -206,6 +212,12 @@ const HUMAN_ARGUMENT_INFO: Record<
     description: "公開された占い結果を根拠にします",
     publicText: "占い師COから人狼判定が出ている",
     emoji: "🐺",
+  },
+  "white-defense": {
+    label: "白判定を根拠に擁護する",
+    description: "公開された白判定を理由に、疑いを弱める意見です",
+    publicText: "公開された占い師COの白判定を根拠に、今は処刑を急がない",
+    emoji: "🛡️",
   },
   "vote-contradiction": {
     label: "発言と投票が矛盾",
@@ -542,54 +554,148 @@ interface NpcResultPublication {
 }
 
 /** Do not let NPCs reason from a CO that Discord never actually published. */
+const claimSubmissions = new WeakMap<GameState, Set<string>>();
+async function withClaimPublication(
+  game: GameState,
+  speaker: Player,
+  operation: () => Promise<number>,
+): Promise<number> {
+  const pending = claimSubmissions.get(game) ?? new Set<string>();
+  const key = `${game.analyticsSessionId ?? "legacy"}:${speaker.id}`;
+  if (pending.has(key)) return 0;
+  pending.add(key);
+  claimSubmissions.set(game, pending);
+  try {
+    return await operation();
+  } finally {
+    pending.delete(key);
+  }
+}
+
 export async function publishNpcResults(
   game: GameState,
   speaker: Player,
   results: NpcResultPublication[],
-): Promise<void> {
-  const sessionId = game.analyticsSessionId;
-  const staged = {
-    ...game,
-    npcClaims: [...game.npcClaims],
-    claimHistory: [...game.claimHistory],
-  };
-  const initialClaims = staged.npcClaims.length;
-  const initialHistory = staged.claimHistory.length;
-  const accepted = results.filter((entry) =>
-    recordRoleClaim(
-      staged,
+): Promise<number> {
+  return withClaimPublication(game, speaker, async () => {
+    if (game.phase !== "day" || !speaker.alive) return 0;
+    const sessionId = game.analyticsSessionId;
+    const day = game.day;
+    const staged = {
+      ...game,
+      npcClaims: [...game.npcClaims],
+      claimHistory: [...game.claimHistory],
+    };
+    const initialClaims = staged.npcClaims.length;
+    const initialHistory = staged.claimHistory.length;
+    const accepted = results.filter((entry) =>
+      recordRoleClaim(
+        staged,
+        speaker,
+        entry.role,
+        entry.target,
+        entry.result,
+        entry.resultDay,
+      ),
+    );
+    if (!accepted.length) return 0;
+    await sendDiscussionMessage(
+      game,
       speaker,
-      entry.role,
-      entry.target,
-      entry.result,
-      entry.resultDay,
-    ),
-  );
-  if (!accepted.length) return;
-  await sendDiscussionMessage(
-    game,
-    speaker,
-    accepted
-      .map((entry) =>
-        roleClaimLine(
-          speaker,
-          entry.role,
-          entry.target,
-          entry.result,
-          entry.resultDay,
-        ),
-      )
-      .join("\n"),
-  );
-  if (game.analyticsSessionId !== sessionId) return;
-  game.npcClaims.push(...staged.npcClaims.slice(initialClaims));
-  game.claimHistory.push(...staged.claimHistory.slice(initialHistory));
-  for (const entry of accepted) {
-    if (entry.memoryScore !== undefined)
-      rememberSuspect(game, speaker.id, entry.target.id, entry.memoryScore);
-    if (entry.shareSuspicion)
-      applyPublicClaimSuspicion(game, entry.target, entry.result);
-  }
+      accepted
+        .map((entry) =>
+          roleClaimLine(
+            speaker,
+            entry.role,
+            entry.target,
+            entry.result,
+            entry.resultDay,
+          ),
+        )
+        .join("\n"),
+    );
+    if (
+      game.analyticsSessionId !== sessionId ||
+      game.day !== day ||
+      (game.phase as GameState["phase"]) !== "day"
+    )
+      return 0;
+    game.npcClaims.push(...staged.npcClaims.slice(initialClaims));
+    game.claimHistory.push(...staged.claimHistory.slice(initialHistory));
+    for (const entry of accepted) {
+      if (entry.memoryScore !== undefined)
+        rememberSuspect(game, speaker.id, entry.target.id, entry.memoryScore);
+      if (entry.shareSuspicion)
+        applyPublicClaimSuspicion(game, entry.target, entry.result);
+    }
+    return accepted.length;
+  });
+}
+
+export async function publishRoleDeclaration(
+  game: GameState,
+  speaker: Player,
+  role: Exclude<ClaimedRole, "占い師" | "霊能者">,
+): Promise<number> {
+  return withClaimPublication(game, speaker, async () => {
+    if (game.phase !== "day" || !speaker.alive) return 0;
+    const sessionId = game.analyticsSessionId;
+    const day = game.day;
+    const staged = {
+      ...game,
+      roleDeclarations: new Set(game.roleDeclarations),
+      claimHistory: [...game.claimHistory],
+    };
+    const initialHistory = staged.claimHistory.length;
+    const lockedRole = claimedRoleForPlayer(game, speaker.id);
+    if (
+      (lockedRole && lockedRole !== role) ||
+      !recordRoleDeclaration(staged, speaker, role)
+    )
+      return 0;
+    await sendDiscussionMessage(
+      game,
+      speaker,
+      roleDeclarationLine(speaker, role),
+    );
+    if (
+      game.analyticsSessionId !== sessionId ||
+      game.day !== day ||
+      (game.phase as GameState["phase"]) !== "day"
+    )
+      return 0;
+    game.roleDeclarations.add(`${day}:${speaker.id}:${role}`);
+    game.claimHistory.push(...staged.claimHistory.slice(initialHistory));
+    return 1;
+  });
+}
+
+export async function publishClaimRetraction(
+  game: GameState,
+  speaker: Player,
+): Promise<ClaimedRole | null> {
+  let retracted: ClaimedRole | null = null;
+  await withClaimPublication(game, speaker, async () => {
+    if (game.phase !== "day" || !speaker.alive) return 0;
+    const sessionId = game.analyticsSessionId;
+    const day = game.day;
+    const role = claimedRoleForPlayer(game, speaker.id);
+    if (!role) return 0;
+    await sendDiscussionMessage(
+      game,
+      speaker,
+      roleRetractionLine(speaker, role),
+    );
+    if (
+      game.analyticsSessionId !== sessionId ||
+      game.day !== day ||
+      (game.phase as GameState["phase"]) !== "day"
+    )
+      return 0;
+    retracted = retractPlayerClaim(game, speaker.id) ?? null;
+    return retracted ? 1 : 0;
+  });
+  return retracted;
 }
 
 async function restoreDivisionChannels(
@@ -2633,7 +2739,9 @@ export function roleDmEmbed(game: GameState, player: Player): EmbedBuilder {
 
   return new EmbedBuilder()
     .setTitle(`${info.icon} 役職｜${role}`)
-    .setDescription(`${info.description}${allyText}${firstResultText}`)
+    .setDescription(
+      `${info.description}${allyText}${firstResultText}${role === "村人" ? "\n\n💡 CO・判定と投票を見比べ、気になる相手に質問できます。「意見を表明」で疑う根拠や、白判定を根拠にした擁護を伝えると、NPCも公開情報と照らして検討します。必ず従うわけではありません。" : ""}`,
+    )
     .addFields({
       name: "勝利条件",
       value: winCondition,
@@ -3256,34 +3364,33 @@ async function handleQuickResultClaim(
     return;
   }
 
-  const publishedLines: string[] = [];
-  for (const { day: resultDay, target, result } of quickResults) {
-    if (
-      !recordRoleClaim(game, claimant, claimedRole, target, result, resultDay)
-    )
-      continue;
-    if (claimedRole === "占い師")
-      applyPublicClaimSuspicion(game, target, result);
-    publishedLines.push(
-      roleClaimLine(claimant, claimedRole, target, result, resultDay),
-    );
-  }
-  if (publishedLines.length === 0) {
-    await interaction.update({
-      content: "その占い結果はすでに公開済みです。",
+  await interaction.deferUpdate();
+  const count = await publishNpcResults(
+    game,
+    claimant,
+    quickResults.map(({ day: resultDay, target, result }) => ({
+      role: claimedRole,
+      target,
+      result,
+      resultDay,
+      shareSuspicion: claimedRole === "占い師",
+    })),
+  );
+  if (count === 0) {
+    await interaction.editReply({
+      content: "公開済み・送信中、または受付が終了しました。",
       components: [],
     });
     return;
   }
 
-  await interaction.update({
+  await interaction.editReply({
     content:
-      publishedLines.length > 1
-        ? `実際の${claimedRole === "占い師" ? "占い" : "霊能"}結果を${publishedLines.length}件まとめて公開しました。`
+      count > 1
+        ? `実際の${claimedRole === "占い師" ? "占い" : "霊能"}結果を${count}件まとめて公開しました。`
         : `実際の${claimedRole === "占い師" ? "占い" : "霊能"}結果をそのまま公開しました。`,
     components: [],
   });
-  await sendDiscussionMessage(game, claimant, publishedLines.join("\n"));
 }
 
 async function handleQuickRoleDeclaration(
@@ -3310,16 +3417,14 @@ async function handleQuickRoleDeclaration(
     });
     return;
   }
-  recordRoleDeclaration(game, claimant, role);
-  await interaction.update({
-    content: `${role}COを公開しました。`,
+  await interaction.deferUpdate();
+  const published = await publishRoleDeclaration(game, claimant, role);
+  await interaction.editReply({
+    content: published
+      ? `${role}COを公開しました。`
+      : "公開済み・送信中、または受付が終了しました。",
     components: [],
   });
-  await sendDiscussionMessage(
-    game,
-    claimant,
-    roleDeclarationLine(claimant, role),
-  );
 }
 
 async function handleFakeSeerClaimOpen(
@@ -3452,23 +3557,19 @@ async function handleClaimRetractionConfirm(
     });
     return;
   }
-  const claimedRole = retractPlayerClaim(game, claimant.id);
+  await interaction.deferUpdate();
+  const claimedRole = await publishClaimRetraction(game, claimant);
   if (!claimedRole) {
-    await interaction.update({
-      content: "取り消せるCOはありません。",
+    await interaction.editReply({
+      content: "取り消せるCOがないか、別のCO操作を送信中です。",
       components: [],
     });
     return;
   }
-  await interaction.update({
+  await interaction.editReply({
     content: `${claimedRole}COを取り消しました。もう一度COし直せます。`,
     components: [],
   });
-  await sendDiscussionMessage(
-    game,
-    claimant,
-    roleRetractionLine(claimant, claimedRole),
-  );
 }
 
 async function handleClaimRetractionCancel(
@@ -3517,13 +3618,18 @@ async function handleClaimRole(
       });
       return;
     }
-    recordRoleDeclaration(game, claimant, requestedRole);
-    await interaction.update({ content: "COを公開しました。", components: [] });
-    await sendDiscussionMessage(
+    await interaction.deferUpdate();
+    const published = await publishRoleDeclaration(
       game,
       claimant,
-      roleDeclarationLine(claimant, requestedRole),
+      requestedRole,
     );
+    await interaction.editReply({
+      content: published
+        ? "COを公開しました。"
+        : "公開済み・送信中、または受付が終了しました。",
+      components: [],
+    });
     return;
   }
   const claimedRole = requestedRole;
@@ -3643,31 +3749,31 @@ async function handleClaimResult(
     return;
   }
 
-  if (
-    !recordRoleClaim(game, claimant, claimedRole, target, result, resultDay)
-  ) {
-    await interaction.update({
+  await interaction.deferUpdate();
+  const published = await publishNpcResults(game, claimant, [
+    {
+      role: claimedRole,
+      target,
+      result,
+      resultDay,
+      shareSuspicion: claimedRole === "占い師",
+    },
+  ]);
+  if (!published) {
+    await interaction.editReply({
       content: "同じ相手へのCOはすでに公開済みです。",
       components: [],
     });
     return;
   }
-  if (claimedRole === "占い師") {
-    applyPublicClaimSuspicion(game, target, result);
-  }
   const remaining = remainingClaimSlots(game, claimant.id, claimedRole);
-  await interaction.update({
+  await interaction.editReply({
     content:
       remaining > 0
         ? `COを公開しました。あと${remaining}件公開できます。`
         : "COを公開しました。",
     components: [],
   });
-  await sendDiscussionMessage(
-    game,
-    claimant,
-    roleClaimLine(claimant, claimedRole, target, result, resultDay),
-  );
 }
 
 export function divisionGroupsForPlayers(
@@ -3859,13 +3965,8 @@ function scheduleNpcDiscussion(game: GameState, daySeconds: number): void {
       const publicClaimRole = npcPublicRoleClaim(game, npc);
       if (
         publicClaimRole &&
-        recordRoleDeclaration(game, npc, publicClaimRole)
+        (await publishRoleDeclaration(game, npc, publicClaimRole))
       ) {
-        await sendDiscussionMessage(
-          game,
-          npc,
-          roleDeclarationLine(npc, publicClaimRole),
-        );
         return;
       }
 
@@ -4047,7 +4148,19 @@ function scheduleNpcVotes(game: GameState): void {
               firstRoundCounts,
             )
           : chooseNpcVoteTarget(npc, targets, suspicion);
-      if (targetId !== undefined) game.votes.set(npc.id, targetId);
+      if (targetId !== undefined) {
+        game.votes.set(npc.id, targetId);
+        const target = targets.find((candidate) => candidate.id === targetId);
+        if (target) {
+          game.npcVoteExplanations ??= new Map();
+          game.npcVoteExplanations.set(npc.id, {
+            voterId: npc.id,
+            targetId,
+            reason: npcSuspicionReason(game, npc, target),
+            personality: npc.npcPersonality ?? "慎重",
+          });
+        }
+      }
       await updateVoteProgress(game);
       if (!isActiveGame(game) || game.phase !== "voting" || game.resolving)
         return;
@@ -4098,6 +4211,7 @@ async function startVoting(game: GameState): Promise<void> {
 async function beginVoting(game: GameState): Promise<void> {
   if (!isActiveGame(game)) return;
   clearGameTimers(game);
+  game.npcVoteExplanations = new Map();
   game.resolving = false;
   game.resolutionQueued = false;
   game.votes.clear();
@@ -4283,7 +4397,14 @@ export function recordCurrentVoteRound(game: GameState): void {
     voterId,
     targetId,
   }));
-  game.voteHistory.push({ day: game.day, round: game.voteRound, ballots });
+  game.voteHistory.push({
+    day: game.day,
+    round: game.voteRound,
+    ballots,
+    npcExplanations: [...(game.npcVoteExplanations?.values() ?? [])]
+      .filter((entry) => game.votes.get(entry.voterId) === entry.targetId)
+      .map((entry) => ({ ...entry })),
+  });
 
   const topIds = topVotedIds(ballots.map((ballot) => ballot.targetId));
   for (const npc of alivePlayers(game).filter((player) => player.isNpc)) {
@@ -4303,12 +4424,68 @@ export function humanOpinionLine(
   reason: HumanArgumentReason,
   previous?: { target: Player; argument: HumanArgument },
 ): string {
-  const speaker = `**${safeName(actor)}**（プレイヤー）　👀`;
+  const speaker = `**${safeName(actor)}**（プレイヤー）　${reason === "white-defense" ? "🛡️" : "👀"}`;
   const statement = previous
     ? `${speaker} 意見変更：**${safeName(previous.target)}** → **${safeName(target)}**`
-    : `${speaker} **${safeName(target)}**を疑う`;
+    : `${speaker} **${safeName(target)}**を${reason === "white-defense" ? "擁護する" : "疑う"}`;
   return `${statement}\n根拠：${HUMAN_ARGUMENT_INFO[reason].publicText}`;
 }
+
+export async function publishHumanArgument(
+  game: GameState,
+  actor: Player,
+  target: Player,
+  reason: HumanArgumentReason,
+  previous?: { target: Player; argument: HumanArgument },
+) {
+  const sessionId = game.analyticsSessionId;
+  const day = game.day;
+  if (game.phase !== "day" || !actor.alive || !target.alive) return null;
+  await sendDiscussionMessage(
+    game,
+    actor,
+    humanOpinionLine(actor, target, reason, previous),
+  );
+  if (
+    game.analyticsSessionId !== sessionId ||
+    game.day !== day ||
+    game.phase !== "day" ||
+    !actor.alive ||
+    !target.alive
+  )
+    return null;
+  const npcs = alivePlayers(game).filter(
+    (npc) => npc.isNpc && sharesDiscussionRoom(game, actor, npc),
+  );
+  const before = new Map(
+    npcs.map((npc) => [npc.id, chooseNpcQuestionAnswer(game, npc)]),
+  );
+  const argument = { targetId: target.id, reason };
+  game.humanSuspicions.set(actor.id, argument);
+  const changedViews = npcs.filter(
+    (npc) =>
+      before.get(npc.id)?.targetId !==
+      chooseNpcQuestionAnswer(game, npc)?.targetId,
+  ).length;
+  const supported = isHumanArgumentSupported(game, argument);
+  game.humanArgumentEffects ??= [];
+  if (game.humanArgumentEffects.length < 300)
+    game.humanArgumentEffects.push({
+      day,
+      speakerId: actor.id,
+      targetId: target.id,
+      stance: reason === "white-defense" ? "defend" : "suspect",
+      changedViews,
+      supported,
+    });
+  return {
+    changedViews,
+    supported,
+    reaction: takeNpcPersuasionReaction(game, actor.id, before),
+  };
+}
+
+const opinionSubmissions = new WeakMap<GameState, Set<string>>();
 
 export function remainingNpcQuestions(
   game: GameState,
@@ -4360,11 +4537,11 @@ async function handleSuspectOpen(
   }
   const menu = new StringSelectMenuBuilder()
     .setCustomId(componentId("suspect", game))
-    .setPlaceholder("いま疑っている人を選ぶ")
+    .setPlaceholder("疑う・擁護する相手を選ぶ")
     .addOptions(playerOptions(targets));
   await interaction.reply({
     content:
-      "疑う相手を選んでください。次に根拠を選びます。意見はあとから変更できます。",
+      "意見を伝える相手を選んでください。次に疑う根拠、または白判定を根拠に擁護を選べます。意見はあとから変更できます。",
     components: [
       new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu),
     ],
@@ -4574,7 +4751,7 @@ async function handleSuspect(
       })),
     );
   await interaction.update({
-    content: `**${safeName(target)}** を疑う根拠を選んでください。\n公開情報に合わない根拠は、NPCから逆に疑われることがあります。`,
+    content: `**${safeName(target)}** への意見を選んでください。\n疑う根拠、または白判定を根拠に擁護を選べます。公開情報に合わない根拠は、NPCから逆に疑われることがあります。`,
     components: [
       new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu),
     ],
@@ -4624,32 +4801,45 @@ async function handleSuspectReason(
   const previousTarget = game.players.find(
     (player) => player.id === previousArgument?.targetId,
   );
-  const argument: HumanArgument = { targetId: target.id, reason };
-  const before = new Map(
-    alivePlayers(game)
-      .filter((npc) => npc.isNpc && sharesDiscussionRoom(game, actor, npc))
-      .map((npc) => [npc.id, chooseNpcQuestionAnswer(game, npc)]),
-  );
-  game.humanSuspicions.set(actor.id, argument);
-  const reaction = takeNpcPersuasionReaction(game, actor.id, before);
-  await interaction.update({
-    content: game.divisionGroups?.has(actor.id)
-      ? "意見を公開しました。同じ分断部屋の参加者とNPCに見えています。"
-      : "意見を公開しました。全員とNPCに見えています。",
-    components: [],
-  });
-  await sendDiscussionMessage(
-    game,
-    actor,
-    humanOpinionLine(
+  const pending = opinionSubmissions.get(game) ?? new Set<string>();
+  if (pending.has(actor.id)) {
+    await interaction.reply({
+      content: "意見を送信中です。少し待ってください。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  pending.add(actor.id);
+  opinionSubmissions.set(game, pending);
+  let outcome: Awaited<ReturnType<typeof publishHumanArgument>>;
+  try {
+    await interaction.deferUpdate();
+    if (!isActiveGame(game) || game.phase !== "day" || game.day !== day) {
+      await interaction.editReply({
+        content: "議論の受付は終了しました。",
+        components: [],
+      });
+      return;
+    }
+    outcome = await publishHumanArgument(
+      game,
       actor,
       target,
       reason,
       previousTarget && previousArgument
         ? { target: previousTarget, argument: previousArgument }
         : undefined,
-    ),
-  );
+    );
+    await interaction.editReply({
+      content: outcome
+        ? `${game.divisionGroups?.has(actor.id) ? "同じ分断部屋に" : "全員に"}意見を公開しました。\n${outcome.supported ? `NPCの見立て変更：${outcome.changedViews}人（投票の確約ではありません）。` : "根拠は公開情報から確認できませんでした。NPCに逆に疑われる場合があります。"}\n意見は1人1件で、変更すると前の意見を置き換えます。`
+        : "議論の受付終了または試合切替により、NPCの判断には反映できませんでした。",
+      components: [],
+    });
+  } finally {
+    pending.delete(actor.id);
+  }
+  const reaction = outcome?.reaction;
   if (
     !reaction ||
     !isActiveGame(game) ||
@@ -4718,7 +4908,7 @@ async function handleVote(
 
   game.votes.set(voter.id, targetId);
   await interaction.reply({
-    content: "投票を受け付けました。",
+    content: `**${safeName(game.players.find((player) => player.id === targetId)!)}**への投票を受け付けました。投票時間内なら変更できます。`,
     flags: MessageFlags.Ephemeral,
   });
   await updateVoteProgress(game);
@@ -6423,7 +6613,16 @@ function voteRecapLines(game: GameState, day: number): string[] {
     .flatMap((record) =>
       record.ballots.map(
         (ballot) =>
-          `${record.round === 1 ? "投票" : "再投票"}｜**${recapPlayerName(game, ballot.voterId)}**${recapPlayer(game, ballot.voterId)?.role === "市長" ? "（2票）" : ""} → **${recapPlayerName(game, ballot.targetId)}**`,
+          `${record.round === 1 ? "投票" : "再投票"}｜**${recapPlayerName(game, ballot.voterId)}**${recapPlayer(game, ballot.voterId)?.role === "市長" ? "（2票）" : ""} → **${recapPlayerName(game, ballot.targetId)}**${(() => {
+            const explanation = record.npcExplanations?.find(
+              (entry) =>
+                entry.voterId === ballot.voterId &&
+                entry.targetId === ballot.targetId,
+            );
+            return explanation
+              ? `\n　${explanation.personality}・投票時の見立て：${explanation.reason}`
+              : "";
+          })()}`,
       ),
     );
 }
@@ -6548,6 +6747,35 @@ function relationshipFields(game: GameState): RecapField[] {
   ];
 }
 
+export function decisionRecapLines(game: GameState): string[] {
+  const lines: string[] = [];
+  const effects = (game.humanArgumentEffects ?? [])
+    .filter((effect) => effect.supported && effect.changedViews > 0)
+    .sort((a, b) => b.changedViews - a.changedViews)
+    .slice(0, 2);
+  for (const effect of effects)
+    lines.push(
+      `${effect.day}日目｜**${recapPlayerName(game, effect.speakerId)}** の${effect.stance === "defend" ? "擁護" : "指摘"}で、NPC ${effect.changedViews}人の見立て先が変化（投票の確約ではありません）`,
+    );
+  const guarded = game.nightHistory.filter((night) => night.guarded).length;
+  if (guarded)
+    lines.push(
+      `護衛成功 **${guarded}夜**。実際の護衛先は夜の行動で確認できます。`,
+    );
+  const explanations = game.voteHistory.flatMap(
+    (record) => record.npcExplanations ?? [],
+  );
+  if (explanations.length)
+    lines.push(
+      `NPCの投票時点の見立て **${explanations.length}件** を日別の投票先に記録。迷い・再投票を含むため、説明は確定した真相ではありません。`,
+    );
+  if (!lines.length)
+    lines.push(
+      "CO・投票・夜行動を日別に確認できます。勝敗の原因や他人の意図を推測して断定はしません。",
+    );
+  return lines;
+}
+
 export function postgameRecapEmbeds(game: GameState): EmbedBuilder[] {
   const roleLines = game.players.map(
     (player) =>
@@ -6557,6 +6785,7 @@ export function postgameRecapEmbeds(game: GameState): EmbedBuilder[] {
     "感想戦｜役職の真相",
     "試合終了後の情報です。評価ではなく、実際に起きたことだけを表示します。",
     [
+      ...recapFields("判断の振り返り", decisionRecapLines(game)),
       ...recapFields("配役", roleLines),
       ...relationshipFields(game),
       ...recapFields("本当の占い結果", trueSeerRecapLines(game)),
@@ -6764,6 +6993,11 @@ async function endGame(game: GameState, winner: Winner): Promise<void> {
   };
   if (!(await openPhasePanel(game, endPayload))) return;
   if (showFeedback) {
+    game.analyticsFeedbackContextByUserId = new Map(
+      game.players
+        .filter((player) => !player.isNpc)
+        .map((player) => [player.id, experienceContext(game, player.id)]),
+    );
     game.analyticsFeedbackPromptShown = true;
     game.analyticsFeedbackMessageId = game.phaseMessage?.id;
     game.analyticsFeedbackSessionId = analyticsSnapshot(game).sessionId;
@@ -6861,6 +7095,24 @@ export function feedbackReasonRows(
   ];
 }
 
+export function npcFeedbackDetailRows(
+  game: GameState,
+  rating: DetailedFeedbackRating,
+): ActionRowBuilder<ButtonBuilder>[] {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      Object.entries(NPC_FEEDBACK_DETAILS).map(([code, label]) =>
+        new ButtonBuilder()
+          .setCustomId(
+            feedbackComponentId(`feedback-npc-${rating}-${code}`, game),
+          )
+          .setLabel(label)
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    ),
+  ];
+}
+
 function feedbackParticipant(game: GameState, userId: string): boolean {
   if (game.analyticsFeedbackEligibleUserIds)
     return game.analyticsFeedbackEligibleUserIds.has(userId);
@@ -6882,6 +7134,7 @@ async function submitFeedback(
   rating: FeedbackRating,
   reason?: FeedbackReason,
   comment?: string,
+  npcDetail?: NpcFeedbackDetail,
 ): Promise<string> {
   game.analyticsFeedbackSubmittedUserIds ??= new Set();
   game.analyticsFeedbackSubmittingUserIds ??= new Set();
@@ -6899,6 +7152,10 @@ async function submitFeedback(
       rating,
       reason,
       comment,
+      npcDetail,
+      experience:
+        game.analyticsFeedbackContextByUserId?.get(userId) ??
+        experienceContext(game, userId),
     });
     if (result.status === "saved" || result.status === "locked")
       game.analyticsFeedbackSubmittedUserIds.add(userId);
@@ -6948,6 +7205,7 @@ async function handleFeedbackReason(
   game: GameState,
   rating: DetailedFeedbackRating,
   reason: FeedbackReason,
+  npcDetail?: NpcFeedbackDetail,
 ): Promise<void> {
   if (!feedbackParticipant(game, interaction.user.id)) {
     await interaction.reply({
@@ -6965,6 +7223,14 @@ async function handleFeedbackReason(
     return;
   }
 
+  if (reason === "npc" && !npcDetail) {
+    await interaction.update({
+      content:
+        "NPCのどの点が気になりましたか？ 1つ選ぶと送信します。詳しく選ばず送ることもできます。",
+      components: npcFeedbackDetailRows(game, rating),
+    });
+    return;
+  }
   if (reason === "other") {
     const comment = new TextInputBuilder()
       .setCustomId("feedback-comment")
@@ -6989,6 +7255,8 @@ async function handleFeedbackReason(
     interaction.user.id,
     rating,
     reason,
+    undefined,
+    npcDetail,
   );
   await interaction.editReply({ content, components: [] });
 }
@@ -7066,6 +7334,8 @@ export function prepareRematchGame(
 ): GameState {
   return {
     ...game,
+    npcVoteExplanations: new Map(),
+    humanArgumentEffects: [],
     phase: "lobby",
     players: game.players
       .filter((player) => !player.isNpc)
@@ -7259,6 +7529,27 @@ export async function handleComponent(
   }
 
   if (interaction.isButton()) {
+    const npcFeedbackDetail =
+      /^feedback-npc-(neutral|issue)-(unfair|inconsistent|unresponsive|repetitive|unspecified)$/.exec(
+        action,
+      );
+    if (npcFeedbackDetail) {
+      if (dayText !== game.analyticsChainId) {
+        await interaction.reply({
+          content: "この連戦の感想受付は終了しました。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      await handleFeedbackReason(
+        interaction,
+        game,
+        npcFeedbackDetail[1] as DetailedFeedbackRating,
+        "npc",
+        npcFeedbackDetail[2] as NpcFeedbackDetail,
+      );
+      return;
+    }
     if (resultActions.has(action) && dayText !== game.analyticsSessionId) {
       await interaction.reply({
         content: "この試合の操作受付は終了しました。",
