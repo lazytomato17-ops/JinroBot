@@ -1,3 +1,6 @@
+// Not a Discord user ID. Keep an explicit ballot distinct from missing votes.
+export const NO_EXECUTION_VOTE = "__no_execution__";
+
 export type VoteOutcome =
   | { kind: "execute"; targetId: string }
   | { kind: "revote"; candidateIds: string[] }
@@ -47,6 +50,8 @@ export function resolveVoteOutcome(
     return { kind: "no-execution", candidateIds: [] };
   }
   if (candidateIds.length === 1) {
+    if (candidateIds[0] === NO_EXECUTION_VOTE)
+      return { kind: "no-execution", candidateIds };
     return { kind: "execute", targetId: candidateIds[0] };
   }
   if (round >= 2) return { kind: "no-execution", candidateIds };
