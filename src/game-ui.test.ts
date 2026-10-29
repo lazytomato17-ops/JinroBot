@@ -89,6 +89,8 @@ import {
   wolfChatRelayPayload,
 } from "./game";
 import { roleConfigFromRoles } from "./roles";
+import { NO_EXECUTION_VOTE, resolveVoteOutcome } from "./presentation";
+import { executionVoteOptions, isValidExecutionVote } from "./game";
 import { buildSoloRoles, chooseNpcVoteTarget } from "./solo";
 import type { GameState, Player, RoleName } from "./types";
 
@@ -146,6 +148,63 @@ function enableBetaHost(game: GameState): void {
 }
 
 describe("ゲーム画面", () => {
+  it("15人でも自分以外と処刑しないを1メニューに収め、再投票は同票候補だけ", () => {
+    const game = makeGame(Array<RoleName>(15).fill("村人"));
+    game.voteCandidateIds.push(NO_EXECUTION_VOTE);
+    expect(executionVoteOptions(game, game.players[0])).toHaveLength(15);
+    expect(
+      executionVoteOptions(game, game.players[0]).some((o) => o.value === "0"),
+    ).toBe(false);
+    expect(isValidExecutionVote(game, game.players[0], NO_EXECUTION_VOTE)).toBe(
+      true,
+    );
+    game.voteCandidateIds = ["0", "1"];
+    expect(executionVoteOptions(game, game.players[0])).toEqual([
+      { label: game.players[1].name, value: "1" },
+    ]);
+    expect(isValidExecutionVote(game, game.players[0], NO_EXECUTION_VOTE)).toBe(
+      false,
+    );
+    expect(isValidExecutionVote(game, game.players[0], "0")).toBe(false);
+    game.players[1].alive = false;
+    expect(isValidExecutionVote(game, game.players[0], "1")).toBe(false);
+  });
+  it("市長の見送りも2票と数え、記録・感想戦に不明を出さない", () => {
+    const game = makeGame(["市長", "人狼", "占い師", "村人"]);
+    game.votes = new Map([
+      ["0", NO_EXECUTION_VOTE],
+      ["1", "2"],
+    ]);
+    expect(weightedVoteTargetIds(game)).toEqual([
+      NO_EXECUTION_VOTE,
+      NO_EXECUTION_VOTE,
+      "2",
+    ]);
+    expect(resolveVoteOutcome(weightedVoteTargetIds(game), 1).kind).toBe(
+      "no-execution",
+    );
+    expect(voteTallyRows(game)).toContain("処刑しない：2票");
+    expect(JSON.stringify(voteBallotFields(game))).toContain(
+      "（2票） → ⏭️ 処刑しない",
+    );
+    recordCurrentVoteRound(game);
+    expect(JSON.stringify(postgameRecapEmbeds(game))).toContain("処刑しない");
+    expect(JSON.stringify(postgameRecapEmbeds(game))).not.toContain(
+      NO_EXECUTION_VOTE,
+    );
+    expect(game.executionHistory).toHaveLength(0);
+  });
+  it("見送り票は投票済みに数え、NPCの人物への疑いには蓄積しない", () => {
+    const game = makeGame(["共有者", "共有者", "人狼", "村人"]);
+    game.voteCandidateIds = ["0", "1", NO_EXECUTION_VOTE];
+    game.votes = new Map(game.players.map((p) => [p.id, NO_EXECUTION_VOTE]));
+    expect(allVotesSubmitted(game)).toBe(true);
+    recordCurrentVoteRound(game);
+    for (const memory of game.npcMemory.values())
+      expect(memory.has(NO_EXECUTION_VOTE)).toBe(false);
+    game.votes.delete("1");
+    expect(allVotesSubmitted(game)).toBe(false);
+  });
   it("CO連打は1回だけ送信し、夜には送らない", async () => {
     const game = makeGame();
     let sent!: (value: unknown) => void;

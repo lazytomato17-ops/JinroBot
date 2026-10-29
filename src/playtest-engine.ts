@@ -8,14 +8,14 @@ import {
   personalityForSerial,
   planNpcSeerClaims,
 } from "./npc";
-import { resolveVoteOutcome, topVotedIds } from "./presentation";
-import { buildRoles, getWinner, roleConfigFromRoles } from "./roles";
 import {
-  assignGameRoles,
-  buildSoloRoles,
-  chooseNpcRevoteTarget,
-  chooseNpcVoteTarget,
-} from "./solo";
+  NO_EXECUTION_VOTE,
+  resolveVoteOutcome,
+  topVotedIds,
+} from "./presentation";
+import { chooseNpcExecutionBallot } from "./execution-vote";
+import { buildRoles, getWinner, roleConfigFromRoles } from "./roles";
+import { assignGameRoles, buildSoloRoles, chooseNpcVoteTarget } from "./solo";
 import type {
   HumanArgument,
   Player,
@@ -367,10 +367,12 @@ function addVoteMemory(
     const targetId = ballots.find(
       (ballot) => ballot.voterId === npc.id,
     )?.targetId;
-    if (targetId) remember(state, npc.id, targetId, 0.5);
+    if (targetId && targetId !== NO_EXECUTION_VOTE)
+      remember(state, npc.id, targetId, 0.5);
     if (npc.npcPersonality === "同調") {
       for (const topId of topIds) {
-        if (topId !== npc.id) remember(state, npc.id, topId, 0.4);
+        if (topId !== npc.id && topId !== NO_EXECUTION_VOTE)
+          remember(state, npc.id, topId, 0.4);
       }
     }
   }
@@ -382,6 +384,7 @@ function castBallots(
   candidates: Player[],
   random: () => number,
   firstRoundBallots?: Array<{ voterId: string; targetId: string }>,
+  allowNoExecution = true,
 ): Array<{ voterId: string; targetId: string }> {
   const firstRoundCounts = new Map<string, number>();
   for (const ballot of firstRoundBallots ?? []) {
@@ -393,18 +396,21 @@ function castBallots(
   return living.flatMap((player) => {
     const valid = candidates.filter((candidate) => candidate.id !== player.id);
     const choices = valid.length ? valid : candidates;
-    const suspicion = npcDecisionSuspicion(state, player);
-    const targetId = firstRoundBallots
-      ? chooseNpcRevoteTarget(
-          player,
-          choices,
-          suspicion,
-          firstRoundBallots.find((ballot) => ballot.voterId === player.id)
-            ?.targetId,
-          firstRoundCounts,
-          random,
-        )
-      : chooseNpcVoteTarget(player, choices, suspicion, random);
+    const targetId = chooseNpcExecutionBallot(
+      state,
+      player,
+      choices,
+      allowNoExecution,
+      random,
+      firstRoundBallots
+        ? {
+            previousTargetId: firstRoundBallots.find(
+              (ballot) => ballot.voterId === player.id,
+            )?.targetId,
+            counts: firstRoundCounts,
+          }
+        : undefined,
+    );
     return targetId === undefined ? [] : [{ voterId: player.id, targetId }];
   });
 }
@@ -709,6 +715,7 @@ export function simulateGame(
         tied,
         random,
         firstBallots,
+        outcome.candidateIds.includes(NO_EXECUTION_VOTE),
       );
       state.voteHistory.push({ day, round: 2, ballots: secondBallots });
       addVoteMemory(state, secondBallots);

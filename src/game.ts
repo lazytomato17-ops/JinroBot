@@ -68,7 +68,6 @@ import {
 import {
   assignGameRoles,
   buildSoloRoles,
-  chooseNpcRevoteTarget,
   chooseNpcVoteTarget,
   npcVoteCandidates,
   SOLO_PLAYER_COUNT,
@@ -95,11 +94,13 @@ import {
 export { npcDecisionSuspicion } from "./npc";
 import {
   countVotes,
+  NO_EXECUTION_VOTE,
   discussionDuration,
   relativeTime,
   resolveVoteOutcome,
   topVotedIds,
 } from "./presentation";
+import { chooseNpcExecutionBallot } from "./execution-vote";
 import { gameStatsFields, recordGameStats } from "./stats";
 import { rankingSettingsRow } from "./ranking";
 import type {
@@ -1616,7 +1617,9 @@ export function voteEmbed(game: GameState): EmbedBuilder {
     )
     .setColor(COLORS.vote)
     .setFooter({
-      text: "自分以外へ投票。結果発表までは非公開で、締切前なら変更できます",
+      text: game.voteCandidateIds.includes(NO_EXECUTION_VOTE)
+        ? "自分以外、または「処刑しない」へ投票。締切前なら変更できます"
+        : "再投票は同票候補のみ。自分以外へ投票し、締切前なら変更できます",
     });
 }
 
@@ -4098,10 +4101,12 @@ function votingPlayers(game: GameState): Player[] {
   const candidates = alivePlayers(game).filter((player) =>
     game.voteCandidateIds.includes(player.id),
   );
-  return alivePlayers(game).filter((player) =>
-    player.isNpc
-      ? npcVoteCandidates(player, candidates).length > 0
-      : candidates.some((candidate) => candidate.id !== player.id),
+  return alivePlayers(game).filter(
+    (player) =>
+      game.voteCandidateIds.includes(NO_EXECUTION_VOTE) ||
+      (player.isNpc
+        ? npcVoteCandidates(player, candidates).length > 0
+        : candidates.some((candidate) => candidate.id !== player.id)),
   );
 }
 
@@ -4134,29 +4139,30 @@ function scheduleNpcVotes(game: GameState): void {
         (player) =>
           player.id !== npc.id && game.voteCandidateIds.includes(player.id),
       );
-      const suspicion = npcDecisionSuspicion(game, npc);
       const previousTargetId = firstRound?.ballots.find(
         (ballot) => ballot.voterId === npc.id,
       )?.targetId;
-      const targetId =
+      const targetId = chooseNpcExecutionBallot(
+        game,
+        npc,
+        targets,
+        game.voteCandidateIds.includes(NO_EXECUTION_VOTE),
+        Math.random,
         game.voteRound > 1
-          ? chooseNpcRevoteTarget(
-              npc,
-              targets,
-              suspicion,
-              previousTargetId,
-              firstRoundCounts,
-            )
-          : chooseNpcVoteTarget(npc, targets, suspicion);
+          ? { previousTargetId, counts: firstRoundCounts }
+          : undefined,
+      );
       if (targetId !== undefined) {
         game.votes.set(npc.id, targetId);
         const target = targets.find((candidate) => candidate.id === targetId);
-        if (target) {
+        if (target || targetId === NO_EXECUTION_VOTE) {
           game.npcVoteExplanations ??= new Map();
           game.npcVoteExplanations.set(npc.id, {
             voterId: npc.id,
             targetId,
-            reason: npcSuspicionReason(game, npc, target),
+            reason: target
+              ? npcSuspicionReason(game, npc, target)
+              : "処刑対象を決めず、今回は見送る判断",
             personality: npc.npcPersonality ?? "慎重",
           });
         }
@@ -4204,7 +4210,10 @@ async function startVoting(game: GameState): Promise<void> {
   game.phaseMessage = undefined;
   game.phase = "voting";
   game.voteRound = 1;
-  game.voteCandidateIds = alivePlayers(game).map((player) => player.id);
+  game.voteCandidateIds = [
+    ...alivePlayers(game).map((player) => player.id),
+    NO_EXECUTION_VOTE,
+  ];
   await beginVoting(game);
 }
 
@@ -4232,7 +4241,11 @@ async function beginVoting(game: GameState): Promise<void> {
           .setLabel(game.voteRound > 1 ? "再投票する" : "投票する")
           .setEmoji("🗳️")
           .setStyle(ButtonStyle.Primary)
-          .setDisabled(candidates.length < 2),
+          .setDisabled(
+            candidates.length +
+              Number(game.voteCandidateIds.includes(NO_EXECUTION_VOTE)) <
+              2,
+          ),
       ),
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         claimListButton(game),
@@ -4342,6 +4355,7 @@ export function resolveWolfTarget(
 
 export function voteTallyRows(game: GameState): string {
   const rows = countVotes(weightedVoteTargetIds(game)).map(({ id, count }) => {
+    if (id === NO_EXECUTION_VOTE) return `⏭️ 処刑しない：${count}票`;
     const player = game.players.find((candidate) => candidate.id === id);
     if (!player) return `不明：${count}票`;
     return `${player.isNpc ? "🤖" : "👤"} ${safeName(player)}：${count}票`;
@@ -4359,9 +4373,12 @@ export function voteBallotFields(
         (candidate) => candidate.id === game.votes.get(voter.id),
       );
       const voterText = `${voter.isNpc ? "🤖" : "👤"} ${safeName(voter)}`;
-      const targetText = target
-        ? `${target.isNpc ? "🤖" : "👤"} ${safeName(target)}`
-        : "不明";
+      const targetText =
+        game.votes.get(voter.id) === NO_EXECUTION_VOTE
+          ? "⏭️ 処刑しない"
+          : target
+            ? `${target.isNpc ? "🤖" : "👤"} ${safeName(target)}`
+            : "不明";
       return `${voterText}${voter.role === "市長" ? "（2票）" : ""} → ${targetText}`;
     });
   if (rows.length === 0) return [{ name: "投票先", value: "投票なし" }];
@@ -4409,10 +4426,12 @@ export function recordCurrentVoteRound(game: GameState): void {
   const topIds = topVotedIds(ballots.map((ballot) => ballot.targetId));
   for (const npc of alivePlayers(game).filter((player) => player.isNpc)) {
     const ownTarget = game.votes.get(npc.id);
-    if (ownTarget) rememberSuspect(game, npc.id, ownTarget, 0.5);
+    if (ownTarget && ownTarget !== NO_EXECUTION_VOTE)
+      rememberSuspect(game, npc.id, ownTarget, 0.5);
     if (npc.npcPersonality === "同調") {
       for (const targetId of topIds) {
-        if (targetId !== npc.id) rememberSuspect(game, npc.id, targetId, 0.4);
+        if (targetId !== npc.id && targetId !== NO_EXECUTION_VOTE)
+          rememberSuspect(game, npc.id, targetId, 0.4);
       }
     }
   }
@@ -4562,11 +4581,8 @@ async function handleVoteOpen(
     });
     return;
   }
-  const targets = alivePlayers(game).filter(
-    (player) =>
-      player.id !== voter.id && game.voteCandidateIds.includes(player.id),
-  );
-  if (targets.length === 0) {
+  const options = executionVoteOptions(game, voter);
+  if (options.length === 0) {
     await interaction.reply({
       content: "投票できる相手がいません。",
       flags: MessageFlags.Ephemeral,
@@ -4577,10 +4593,10 @@ async function handleVoteOpen(
     .setCustomId(componentId("vote", game))
     .setPlaceholder(
       game.voteRound > 1
-        ? "再投票する人を選んでください"
-        : "処刑したい人を選んでください",
+        ? "再投票先を選んでください"
+        : "処刑する相手、または処刑しないを選択",
     )
-    .addOptions(playerOptions(targets));
+    .addOptions(options);
   await interaction.reply({
     content: game.votes.has(voter.id)
       ? "投票先を変更できます。"
@@ -4590,6 +4606,32 @@ async function handleVoteOpen(
     ],
     flags: MessageFlags.Ephemeral,
   });
+}
+
+export function executionVoteOptions(game: GameState, voter: Player) {
+  const options = playerOptions(
+    alivePlayers(game).filter(
+      (player) =>
+        player.id !== voter.id && game.voteCandidateIds.includes(player.id),
+    ),
+  );
+  if (game.voteCandidateIds.includes(NO_EXECUTION_VOTE))
+    options.push({ label: "⏭️ 処刑しない", value: NO_EXECUTION_VOTE });
+  return options;
+}
+
+export function isValidExecutionVote(
+  game: GameState,
+  voter: Player,
+  targetId: string,
+): boolean {
+  return (
+    voter.alive &&
+    targetId !== voter.id &&
+    game.voteCandidateIds.includes(targetId) &&
+    (targetId === NO_EXECUTION_VOTE ||
+      game.players.some((player) => player.alive && player.id === targetId))
+  );
 }
 
 async function handleNpcQuestionOpen(
@@ -4895,10 +4937,7 @@ async function handleVote(
     });
     return;
   }
-  if (
-    !alivePlayers(game).some((player) => player.id === targetId) ||
-    !game.voteCandidateIds.includes(targetId)
-  ) {
+  if (!isValidExecutionVote(game, voter, targetId)) {
     await interaction.reply({
       content: "その人には投票できません。",
       flags: MessageFlags.Ephemeral,
@@ -4908,7 +4947,7 @@ async function handleVote(
 
   game.votes.set(voter.id, targetId);
   await interaction.reply({
-    content: `**${safeName(game.players.find((player) => player.id === targetId)!)}**への投票を受け付けました。投票時間内なら変更できます。`,
+    content: `**${targetId === NO_EXECUTION_VOTE ? "処刑しない" : safeName(game.players.find((player) => player.id === targetId)!)}**への投票を受け付けました。投票時間内なら変更できます。`,
     flags: MessageFlags.Ephemeral,
   });
   await updateVoteProgress(game);
@@ -4993,7 +5032,7 @@ async function revealVoteResult(game: GameState): Promise<void> {
           new EmbedBuilder()
             .setTitle(`${game.day}日目｜同票`)
             .setDescription(
-              `${playerNameRows(tied)} が同票でした。\n\n再投票を行います。`,
+              `${[playerNameRows(tied), outcome.candidateIds.includes(NO_EXECUTION_VOTE) ? "⏭️ 処刑しない" : ""].filter(Boolean).join("\n")} が同票でした。\n\n再投票を行います。`,
             )
             .addFields(
               { name: "得票数", value: voteTallyRows(game) },
@@ -5016,9 +5055,13 @@ async function revealVoteResult(game: GameState): Promise<void> {
   if (outcome.kind === "no-execution") {
     game.lastExecuted = undefined;
     game.phaseEndsAt = Date.now() + holdSeconds * 1000;
-    const noExecutionText = outcome.candidateIds.length
-      ? "同票のため、本日の処刑はありません。"
-      : "投票が集まらなかったため、本日の処刑はありません。";
+    const noExecutionText =
+      outcome.candidateIds.length === 1 &&
+      outcome.candidateIds[0] === NO_EXECUTION_VOTE
+        ? "「処刑しない」が最多票のため、本日の処刑はありません。"
+        : outcome.candidateIds.length
+          ? "同票のため、本日の処刑はありません。"
+          : "投票が集まらなかったため、本日の処刑はありません。";
     if (
       !(await updateOrReplacePhasePanel(game, {
         embeds: [
@@ -6527,6 +6570,7 @@ function recapPlayer(game: GameState, playerId: string): Player | undefined {
 }
 
 function recapPlayerName(game: GameState, playerId: string): string {
+  if (playerId === NO_EXECUTION_VOTE) return "処刑しない";
   const player = recapPlayer(game, playerId);
   return player ? safeName(player) : "不明";
 }
@@ -6640,7 +6684,12 @@ function voteResultRecapLine(game: GameState, day: number): string {
     ),
     finalVote.round,
   );
-  if (outcome.kind !== "execute") return "処刑なし";
+  if (outcome.kind !== "execute")
+    return outcome.kind === "no-execution" &&
+      outcome.candidateIds.length === 1 &&
+      outcome.candidateIds[0] === NO_EXECUTION_VOTE
+      ? "処刑なし（「処刑しない」が最多票）"
+      : "処刑なし";
   const executed = recapPlayer(game, outcome.targetId);
   return executed
     ? `**${safeName(executed)}** を処刑（実際：${executed.role}）`
