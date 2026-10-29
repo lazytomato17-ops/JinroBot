@@ -36,6 +36,7 @@ export type NpcSeerClaimPlan = "day1" | "day2" | "never";
 export type PublicResult = "人狼" | "人間";
 export type ClaimedRole = RoleName;
 export type HumanArgumentReason =
+  | "white-defense"
   | "black-result"
   | "vote-contradiction"
   | "broken-claim"
@@ -49,6 +50,12 @@ export interface HumanArgument {
 }
 
 export interface VoteRecord {
+  npcExplanations?: Array<{
+    voterId: string;
+    targetId: string;
+    reason: string;
+    personality: NpcPersonality;
+  }>;
   day: number;
   round: number;
   ballots: Array<{ voterId: string; targetId: string }>;
@@ -116,6 +123,27 @@ export interface Player {
 }
 
 export interface GameState {
+  npcVoteExplanations?: Map<
+    string,
+    {
+      voterId: string;
+      targetId: string;
+      reason: string;
+      personality: NpcPersonality;
+    }
+  >;
+  humanArgumentEffects?: Array<{
+    day: number;
+    speakerId: string;
+    targetId: string;
+    stance: "suspect" | "defend";
+    changedViews: number;
+    supported: boolean;
+  }>;
+  analyticsFeedbackContextByUserId?: Map<
+    string,
+    import("./experience").ExperienceContext
+  >;
   channelId: string;
   channel: TextChannel;
   hostId: string;

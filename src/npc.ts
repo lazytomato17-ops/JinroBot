@@ -85,6 +85,7 @@ const DISPROVED_BLACK_CLAIM_SCORE = 1;
 const LONE_DAY_ONE_SEER_PROTECTION = 2.5;
 
 export const HUMAN_ARGUMENT_REASONS: HumanArgumentReason[] = [
+  "white-defense",
   "black-result",
   "vote-contradiction",
   "broken-claim",
@@ -121,7 +122,7 @@ export function takeNpcPersuasionReaction(
     !isHumanArgumentSupported(game, argument)
   )
     return null;
-  const key = `${game.day}:${speakerId}`;
+  const key = `${game.analyticsSessionId ?? "legacy"}:${game.day}:${speakerId}`;
   const sent = persuasionReplies.get(game) ?? new Set<string>();
   if (sent.has(key)) return null;
   for (const npc of game.players) {
@@ -150,7 +151,8 @@ type NpcDecisionContext = Pick<
   | "humanSuspicions"
   | "executionHistory"
   | "voteHistory"
->;
+> &
+  Partial<Pick<GameState, "analyticsSessionId">>;
 
 type HumanArgumentContext = Pick<
   GameState,
@@ -306,6 +308,26 @@ export function isHumanArgumentSupported(
   game: HumanArgumentContext,
   argument: HumanArgument,
 ): boolean {
+  if (argument.reason === "white-defense") {
+    const disproved = logicallyDisprovedSeerIds(game);
+    const conflicts = conflictingSeerClaimantIds(game.npcClaims);
+    return (
+      game.npcClaims.some(
+        (claim) =>
+          claim.claimedRole === "占い師" &&
+          claim.targetId === argument.targetId &&
+          claim.result === "人間" &&
+          !disproved.has(claim.speakerId) &&
+          !conflicts.has(claim.speakerId),
+      ) &&
+      !game.npcClaims.some(
+        (claim) =>
+          claim.claimedRole === "占い師" &&
+          claim.targetId === argument.targetId &&
+          claim.result === "人狼",
+      )
+    );
+  }
   if (argument.reason === "intuition") return true;
   if (argument.reason === "black-result") {
     return game.npcClaims.some(
@@ -337,6 +359,7 @@ export function humanArgumentScore(
   argument: HumanArgument,
 ): number {
   if (!isHumanArgumentSupported(game, argument)) return 0;
+  if (argument.reason === "white-defense") return -0.6;
   if (argument.reason === "broken-claim") return 4;
   if (argument.reason === "vote-contradiction") return 2;
   if (argument.reason === "black-result") return 0.75;
@@ -458,11 +481,19 @@ export function npcDecisionSuspicion(
   }
 
   const argumentScores = new Map<string, number>();
+  const defenceScores = new Map<string, number>();
   for (const [speakerId, argument] of game.humanSuspicions) {
     if (!game.players.some((player) => player.id === speakerId && player.alive))
       continue;
     const score =
       humanArgumentScore(game, argument) * argumentWeight(npc, argument.reason);
+    if (score < 0) {
+      defenceScores.set(
+        argument.targetId,
+        Math.max(-1.2, (defenceScores.get(argument.targetId) ?? 0) + score),
+      );
+      continue;
+    }
     if (score > 0) {
       argumentScores.set(
         argument.targetId,
@@ -489,11 +520,16 @@ export function npcDecisionSuspicion(
       (sharedSignals.get(speaker.id) ?? 0) + baselessPenalty,
     );
   }
+  for (const [targetId, score] of defenceScores)
+    argumentScores.set(targetId, (argumentScores.get(targetId) ?? 0) + score);
   for (const [targetId, score] of argumentScores) {
     const publicScore = sharedSignals.get(targetId) ?? 0;
     sharedSignals.set(
       targetId,
-      Math.min(MAX_SHARED_ARGUMENT_SCORE, publicScore + score),
+      Math.max(
+        -MAX_SHARED_ARGUMENT_SCORE,
+        Math.min(MAX_SHARED_ARGUMENT_SCORE, publicScore + score),
+      ),
     );
   }
 

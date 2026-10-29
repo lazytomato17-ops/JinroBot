@@ -121,7 +121,77 @@ function questionGame(players: Player[]): QuestionGame {
 }
 
 describe("NPCの非公開情報に対する公平性", () => {
-  it.each(["村人", "騎士", "霊能者"] as const)(
+  it("擁護は公開白が必要で、黒判定があれば通らず、真の役職を参照しない", () => {
+    const observer = questionPlayer("observer", "村人");
+    const target = questionPlayer("target", "人狼");
+    const seer = questionPlayer("seer", "村人");
+    const game = questionGame([observer, target, seer]);
+    const argument = { targetId: "target", reason: "white-defense" as const };
+    expect(isHumanArgumentSupported(game, argument)).toBe(false);
+    game.npcClaims.push({
+      day: 1,
+      speakerId: "seer",
+      claimedRole: "占い師",
+      targetId: "target",
+      result: "人間",
+    });
+    expect(humanArgumentScore(game, argument)).toBe(-0.6);
+    target.role = "村人";
+    seer.role = "人狼";
+    expect(humanArgumentScore(game, argument)).toBe(-0.6);
+    game.npcClaims.push({
+      day: 1,
+      speakerId: "other",
+      claimedRole: "占い師",
+      targetId: "target",
+      result: "人狼",
+    });
+    expect(isHumanArgumentSupported(game, argument)).toBe(false);
+  });
+  it("擁護を多人数で重ねても影響は一定以上増えない", () => {
+    const observer = questionPlayer("observer", "村人");
+    const target = questionPlayer("target", "村人");
+    const seer = questionPlayer("seer", "占い師");
+    const humans = Array.from({ length: 8 }, (_, i) =>
+      questionPlayer(`human${i}`, "村人", false),
+    );
+    const game = questionGame([observer, target, seer, ...humans]);
+    game.npcClaims.push({
+      day: 1,
+      speakerId: "seer",
+      claimedRole: "占い師",
+      targetId: "target",
+      result: "人間",
+    });
+    for (const human of humans.slice(0, 4))
+      game.humanSuspicions.set(human.id, {
+        targetId: "target",
+        reason: "white-defense",
+      });
+    const four = npcDecisionSuspicion(game, observer).get("target");
+    for (const human of humans)
+      game.humanSuspicions.set(human.id, {
+        targetId: "target",
+        reason: "white-defense",
+      });
+    expect(npcDecisionSuspicion(game, observer).get("target")).toBe(four);
+  });
+  it.each([
+    "村人",
+    "騎士",
+    "霊能者",
+    "検死官",
+    "タフガイ",
+    "逃亡者",
+    "暗殺者",
+    "猫又",
+    "方位磁針",
+    "狼憑き",
+    "呪われた村人",
+    "パン屋",
+    "市長",
+    "怪盗",
+  ] as const)(
     "%s NPCは他人の真の役職を入れ替えても推理・質問・投票を変えない",
     (role) => {
       const observer = questionPlayer("observer", role);

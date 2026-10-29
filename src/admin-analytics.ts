@@ -12,6 +12,11 @@ import {
   type LatestReleaseAnalytics,
 } from "./match-analytics";
 import type { Winner } from "./types";
+import {
+  buildExperienceFeedbackLines,
+  buildExperienceSessionLines,
+  type ExperienceFeedbackRow,
+} from "./experience";
 
 const REQUEST_TIMEOUT_MS = 5000;
 const REPORT_DAYS = 7;
@@ -174,6 +179,7 @@ export interface GuildFunnelSummary {
 }
 
 export interface AdminAnalyticsReport {
+  experienceLines?: string[];
   range: AnalyticsRange;
   current: AnalyticsPeriodTotals;
   previous: AnalyticsPeriodTotals;
@@ -632,10 +638,7 @@ export function buildAdminAnalyticsReport(
     retention,
     sessions,
     guildFunnel,
-    latestRelease: buildLatestReleaseAnalytics(
-      versionRows,
-      currentVersion,
-    ),
+    latestRelease: buildLatestReleaseAnalytics(versionRows, currentVersion),
     versions: [...versionCounts]
       .map(([version, starts]) => ({ version, starts }))
       .sort((left, right) => right.starts - left.starts),
@@ -712,7 +715,9 @@ async function loadGuildFunnelRows(
       );
       return { enabled: true, extended: false, rows };
     } catch (error) {
-      console.warn(`Guild funnel analytics unavailable: ${errorMessage(error)}`);
+      console.warn(
+        `Guild funnel analytics unavailable: ${errorMessage(error)}`,
+      );
       return { enabled: false, extended: false, rows: [] };
     }
   }
@@ -819,9 +824,7 @@ export async function getAdminAnalytics(
         loadPlayerSessionRows(client, previousStartIso, currentEndIso),
         client
           .from("tomatobot_player_retention_cohorts")
-          .select(
-            "cohort_day_jst,new_players,returned_day_1,returned_day_7",
-          )
+          .select("cohort_day_jst,new_players,returned_day_1,returned_day_7")
           .gte("cohort_day_jst", range.previousStart)
           .lte("cohort_day_jst", range.currentEnd),
         loadGuildFunnelRows(client, previousStartIso, currentEndIso),
@@ -854,19 +857,80 @@ export async function getAdminAnalytics(
       return sessionPeriod(session, range) === "current";
     });
 
+    let experienceLines: string[];
+    try {
+      const feedbackRows: ExperienceFeedbackRow[] = [];
+      let cursor:
+        | { created_at: string; session_id: string; participant_hash: string }
+        | undefined;
+      // Page by stable composite key; raw comments and names are never loaded.
+      for (;;) {
+        let query = client
+          .from("tomatobot_match_feedback")
+          .select(
+            "created_at,session_id,participant_hash,rating,reason,npc_detail,experience_context",
+          )
+          .gte(
+            "created_at",
+            new Date(`${range.currentStart}T00:00:00+09:00`).toISOString(),
+          )
+          .lt("created_at", currentEndIso)
+          .order("created_at", { ascending: true })
+          .order("session_id", { ascending: true })
+          .order("participant_hash", { ascending: true })
+          .limit(QUERY_PAGE_SIZE);
+        if (cursor)
+          query = query.or(
+            `created_at.gt.${cursor.created_at},and(created_at.eq.${cursor.created_at},session_id.gt.${cursor.session_id}),and(created_at.eq.${cursor.created_at},session_id.eq.${cursor.session_id},participant_hash.gt.${cursor.participant_hash})`,
+          );
+        const feedback = await query;
+        if (feedback.error) throw feedback.error;
+        const page = (feedback.data ?? []) as Array<
+          ExperienceFeedbackRow & {
+            created_at: string;
+            session_id: string;
+            participant_hash: string;
+          }
+        >;
+        feedbackRows.push(...page);
+        if (page.length < QUERY_PAGE_SIZE) break;
+        cursor = page[page.length - 1];
+        if (!cursor.participant_hash)
+          throw new Error("Legacy feedback cursor has no participant hash");
+      }
+      experienceLines = [
+        ...buildExperienceSessionLines(
+          versions.filter((session) => session.started_at),
+          participants,
+        ),
+        ...buildExperienceFeedbackLines(feedbackRows),
+      ];
+    } catch {
+      experienceLines = [
+        ...buildExperienceSessionLines(
+          versions.filter((session) => session.started_at),
+          participants,
+        ),
+        "感想の詳細分類は取得できませんでした。移行SQLと接続を確認してください。",
+      ];
+    }
+
     return {
       status: "found",
-      report: buildAdminAnalyticsReport(
-        (daily.data ?? []) as DailyAnalyticsRow[],
-        (abandons.data ?? []) as AbandonAnalyticsRow[],
-        versions,
-        players,
-        sessionSummary,
-        now,
-        guildFunnel,
-        retention,
-        analyticsAppVersion(),
-      ),
+      report: {
+        ...buildAdminAnalyticsReport(
+          (daily.data ?? []) as DailyAnalyticsRow[],
+          (abandons.data ?? []) as AbandonAnalyticsRow[],
+          versions,
+          players,
+          sessionSummary,
+          now,
+          guildFunnel,
+          retention,
+          analyticsAppVersion(),
+        ),
+        experienceLines,
+      },
     };
   } catch (error) {
     console.error(`Admin analytics read failed: ${errorMessage(error)}`);
@@ -943,7 +1007,9 @@ function latestReleaseText(latest: LatestReleaseAnalytics): string {
     `対象 **${versionLabel(latest.version)}**｜開始 **${latest.started}**｜完走 **${latest.completed}**`,
   ];
   if (latest.completed === 0) {
-    lines.push("この更新後の完走データはまだありません。勝率調整は保留します。");
+    lines.push(
+      "この更新後の完走データはまだありません。勝率調整は保留します。",
+    );
     return lines.join("\n");
   }
   lines.push(
@@ -1135,5 +1201,16 @@ export async function handleAdminAnalyticsCommand(
     return;
   }
 
-  await interaction.editReply({ embeds: [adminAnalyticsEmbed(result.report)] });
+  const embeds = [adminAnalyticsEmbed(result.report)];
+  if (result.report.experienceLines?.length)
+    embeds.push(
+      new EmbedBuilder()
+        .setTitle("体験の内訳｜直近7日")
+        .setDescription(result.report.experienceLines.join("\n").slice(0, 4000))
+        .setColor(0x5865f2)
+        .setFooter({
+          text: "区分内2戦以上は常連を含む期間内の人数です。新規ユーザーの継続率とは別です。個人名・会話本文は表示しません。",
+        }),
+    );
+  await interaction.editReply({ embeds });
 }

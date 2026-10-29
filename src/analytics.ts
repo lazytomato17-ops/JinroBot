@@ -2,6 +2,7 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { createHmac } from "node:crypto";
 import type { GameplayAnalyticsSummary } from "./match-analytics";
 import type { Winner } from "./types";
+import type { ExperienceContext, NpcFeedbackDetail } from "./experience";
 
 const REQUEST_TIMEOUT_MS = 5000;
 
@@ -477,6 +478,8 @@ export async function recordMatchFeedback(input: {
   rating: FeedbackRating;
   reason?: FeedbackReason;
   comment?: string;
+  npcDetail?: NpcFeedbackDetail;
+  experience?: ExperienceContext;
 }): Promise<FeedbackResult> {
   const comment = input.comment?.trim().slice(0, 1000) || null;
   try {
@@ -486,13 +489,21 @@ export async function recordMatchFeedback(input: {
     if (!participantHash) return { status: "disabled" };
 
     const { data, error } = await client.rpc(
-      "tomatobot_submit_match_feedback",
+      input.experience
+        ? "tomatobot_submit_experience_feedback"
+        : "tomatobot_submit_match_feedback",
       {
         p_session_id: input.sessionId,
         p_participant_hash: participantHash,
         p_rating: input.rating,
         p_reason: input.reason ?? null,
         p_comment: comment,
+        ...(input.experience
+          ? {
+              p_npc_detail: input.npcDetail ?? null,
+              p_context: input.experience,
+            }
+          : {}),
       },
     );
     if (error) throw error;
