@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DiagnosticRow, AnalyticsResult } from "./analytics";
 import type { GameState } from "./types";
+import { MessageFlags } from "discord.js";
 
 const mocks = vi.hoisted(() => ({ rows: [] as DiagnosticRow[] }));
 vi.mock("./analytics", () => ({
@@ -55,6 +56,79 @@ afterEach(() => {
 });
 
 describe("private match diagnostics", () => {
+  it("excludes ephemeral interaction replies, including edits and deletes", async () => {
+    const d = await import("./game-diagnostics");
+    d.startGameDiagnostics(game());
+    const privateReply = {
+      ...message("非公開の役職・選択先"),
+      author: { id: "bot", bot: true },
+      flags: { has: (flag: number) => flag === MessageFlags.Ephemeral },
+    };
+    d.recordGameMessage(privateReply);
+    d.recordGameMessage(privateReply, "edit");
+    d.recordGameMessage(privateReply, "delete");
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(mocks.rows.some((row) => row.content?.includes("非公開"))).toBe(
+      false,
+    );
+    expect(mocks.rows.filter((row) => row.kind === "message")).toHaveLength(0);
+  });
+
+  it("separates a rapid rematch when the real handler mutates the same GameState", async () => {
+    const d = await import("./game-diagnostics");
+    const g = game();
+    d.startGameDiagnostics(g);
+    g.day = 2;
+    d.finishGameDiagnostics(g, "completed");
+    Object.assign(g, { ...game("session-2"), day: 0, phase: "lobby" });
+    d.recordGameDiagnostic(g, "must_not_mix", {});
+    g.day = 1;
+    d.startGameDiagnostics(g);
+    d.recordGameMessage(message("再戦中の発言", "new"));
+    d.finishGameDiagnostics(g, "completed");
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(
+      mocks.rows.find((row) => row.content === "再戦中の発言")?.session_id,
+    ).toBe("session-2");
+    expect(mocks.rows.some((row) => row.kind === "must_not_mix")).toBe(false);
+    expect(
+      mocks.rows.find(
+        (row) => row.session_id === "session-2" && row.kind === "start",
+      )?.sequence,
+    ).toBe(1);
+    expect(
+      mocks.rows.find(
+        (row) =>
+          row.session_id === "session-1" && row.kind === "recording_closed",
+      )?.day,
+    ).toBe(2);
+    expect(
+      mocks.rows
+        .filter((row) => row.kind === "finish")
+        .map((row) => row.session_id),
+    ).toEqual(["session-1", "session-2"]);
+  });
+
+  it("keeps postgame participant aliases frozen while a rematch lobby changes", async () => {
+    const d = await import("./game-diagnostics");
+    const g = game();
+    d.startGameDiagnostics(g);
+    d.finishGameDiagnostics(g, "completed");
+    g.day = 0;
+    g.players = [{ ...g.players[0], id: "new-joiner" }];
+    d.recordGameMessage({
+      ...message("次の参加者の会話"),
+      author: { id: "new-joiner", bot: false },
+    });
+    d.recordGameMessage(message("前の参加者の感想", "feedback"));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(mocks.rows.some((row) => row.content === "次の参加者の会話")).toBe(
+      false,
+    );
+    expect(
+      mocks.rows.find((row) => row.content === "前の参加者の感想"),
+    ).toMatchObject({ actor: "P1", day: 1, phase: "ended" });
+  });
   it("the actual Discord message handler forwards public game messages", async () => {
     const d = await import("./game-diagnostics");
     const { handleGuildMessage } = await import("./game");

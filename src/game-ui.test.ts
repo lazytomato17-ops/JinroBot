@@ -38,6 +38,8 @@ import {
   lobbyPayload,
   mediumResultRecipients,
   nightEmbed,
+  morningEmbed,
+  publishNpcResults,
   nightActionForPlayer,
   openingActionForPlayer,
   nextNpcSeerTarget,
@@ -139,6 +141,86 @@ function enableBetaHost(game: GameState): void {
 }
 
 describe("ゲーム画面", () => {
+  it("DiscordへCOを送れない場合は、NPCの公開情報・疑い・履歴を増やさない", async () => {
+    const game = makeGame();
+    game.channel = {
+      send: vi.fn().mockRejectedValue({ code: 50001 }),
+    } as unknown as TextChannel;
+    await expect(
+      publishNpcResults(game, game.players[1], [
+        {
+          role: "占い師",
+          target: game.players[0],
+          result: "人狼",
+          resultDay: 1,
+          memoryScore: 6,
+          shareSuspicion: true,
+        },
+      ]),
+    ).rejects.toEqual({ code: 50001 });
+    expect(game.npcClaims).toHaveLength(0);
+    expect(game.claimHistory).toHaveLength(0);
+    expect(game.npcMemory.size).toBe(0);
+    expect(game.npcSuspicion.size).toBe(0);
+  });
+
+  it("COの送信完了まで推理に反映せず、同時に入った別プレイヤーの情報を残す", async () => {
+    const game = makeGame();
+    let sent!: (value: unknown) => void;
+    const pending = new Promise((resolve) => {
+      sent = resolve;
+    });
+    game.channel = {
+      send: vi.fn().mockReturnValue(pending),
+    } as unknown as TextChannel;
+    const publish = publishNpcResults(game, game.players[1], [
+      {
+        role: "占い師",
+        target: game.players[0],
+        result: "人狼",
+        resultDay: 1,
+        memoryScore: 6,
+        shareSuspicion: true,
+      },
+    ]);
+    expect(game.npcClaims).toHaveLength(0);
+    game.claimHistory.push({
+      action: "claim",
+      day: 1,
+      speakerId: "human",
+      claimedRole: "村人",
+    });
+    sent({ id: "published" });
+    await publish;
+    expect(game.npcClaims).toHaveLength(1);
+    expect(game.claimHistory).toHaveLength(2);
+    expect(game.claimHistory[0].speakerId).toBe("human");
+    expect(
+      game.npcMemory.get(game.players[1].id)?.get(game.players[0].id),
+    ).toBe(6);
+    expect(game.npcSuspicion.get(game.players[0].id)).toBeGreaterThan(0);
+  });
+
+  it("送信待ちに次の試合へ切り替わった場合は古いCOを新しい試合へ入れない", async () => {
+    const game = makeGame();
+    game.analyticsSessionId = "old";
+    let sent!: (value: unknown) => void;
+    game.channel = {
+      send: vi.fn().mockReturnValue(
+        new Promise((resolve) => {
+          sent = resolve;
+        }),
+      ),
+    } as unknown as TextChannel;
+    const publish = publishNpcResults(game, game.players[1], [
+      { role: "占い師", target: game.players[0], result: "人狼", resultDay: 1 },
+    ]);
+    game.analyticsSessionId = "new";
+    sent({ id: "published" });
+    await publish;
+    expect(game.npcClaims).toHaveLength(0);
+    expect(game.claimHistory).toHaveLength(0);
+  });
   it("ゲーム終了理由は任意の5択で、保存値と表示を分離する", () => {
     const rows = abandonReasonRows(
       "12345678901234567890",
@@ -208,6 +290,28 @@ describe("ゲーム画面", () => {
     game.voteRound = 2;
     expect(voteEmbed(game).toJSON().title).toBe("1日目｜再投票");
     expect(nightEmbed(game).toJSON().title).toBe("1日目｜夜");
+    expect(nightEmbed(game).toJSON().description).toContain(
+      "操作のない人・選択済みの人",
+    );
+    expect(nightEmbed(game).toJSON().description).toContain(
+      "締切で、自動的に進行",
+    );
+  });
+
+  it("夜明けの朝は翌日として表示し、夜の履歴用の日数は変更しない", () => {
+    const game = makeGame();
+    game.day = 1;
+    expect(
+      morningEmbed(game, "昨夜の犠牲者はいませんでした。", false).toJSON(),
+    ).toMatchObject({
+      title: "2日目｜朝",
+      description: "昨夜の犠牲者はいませんでした。",
+    });
+    expect(game.day).toBe(1);
+    game.day = 5;
+    expect(
+      morningEmbed(game, "昨夜、村人が死亡しました。", true).toJSON().title,
+    ).toBe("6日目｜朝");
   });
 
   it("好評だった開始画面と役職DMの構成を維持する", () => {
