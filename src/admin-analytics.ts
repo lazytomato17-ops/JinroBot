@@ -15,6 +15,9 @@ import type { Winner } from "./types";
 import {
   buildExperienceFeedbackLines,
   buildExperienceSessionLines,
+  TEMPO_FEEDBACK_COMMENTS,
+  tempoFeedbackLines,
+  type TempoFeedbackDetail,
   type ExperienceFeedbackRow,
 } from "./experience";
 
@@ -898,12 +901,51 @@ export async function getAdminAnalytics(
         if (!cursor.participant_hash)
           throw new Error("Legacy feedback cursor has no participant hash");
       }
+      const tempoTotal = feedbackRows.filter(
+        (row) => row.reason === "tempo",
+      ).length;
+      let tempoLines: string[] = [];
+      if (tempoTotal) {
+        try {
+          // Count only fixed choice texts on the server; do not retrieve free comments.
+          const counts = await Promise.all(
+            Object.entries(TEMPO_FEEDBACK_COMMENTS).map(
+              async ([key, comment]) => {
+                const response = await client
+                  .from("tomatobot_match_feedback")
+                  .select("session_id", { count: "exact", head: true })
+                  .eq("reason", "tempo")
+                  .eq("comment", comment)
+                  .gte(
+                    "created_at",
+                    new Date(
+                      `${range.currentStart}T00:00:00+09:00`,
+                    ).toISOString(),
+                  )
+                  .lt("created_at", currentEndIso);
+                if (response.error || response.count === null)
+                  throw response.error ?? new Error("Missing tempo count");
+                return [key, response.count] as [TempoFeedbackDetail, number];
+              },
+            ),
+          );
+          tempoLines = tempoFeedbackLines(
+            tempoTotal,
+            Object.fromEntries(counts),
+          );
+        } catch {
+          tempoLines = [
+            "テンポの速い／遅いの内訳は取得できませんでした。方向は未確認です。",
+          ];
+        }
+      }
       experienceLines = [
         ...buildExperienceSessionLines(
           versions.filter((session) => session.started_at),
           participants,
         ),
         ...buildExperienceFeedbackLines(feedbackRows),
+        ...tempoLines,
       ];
     } catch {
       experienceLines = [

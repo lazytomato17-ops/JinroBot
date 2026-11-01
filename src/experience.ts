@@ -9,6 +9,32 @@ export const NPC_FEEDBACK_DETAILS = {
   unspecified: "詳しくは選ばず送信",
 } as const;
 export type NpcFeedbackDetail = keyof typeof NPC_FEEDBACK_DETAILS;
+export const TEMPO_FEEDBACK_COMMENTS = {
+  fast: "テンポ：進行が速すぎる",
+  slow: "テンポ：待ち時間が長い",
+  unspecified: "テンポ：詳しくは選ばず送信",
+} as const;
+export type TempoFeedbackDetail = keyof typeof TEMPO_FEEDBACK_COMMENTS;
+
+export function tempoFeedbackLines(
+  total: number,
+  counts: Partial<Record<TempoFeedbackDetail, number>>,
+): string[] {
+  if (!total) return [];
+  const lines = Object.entries(TEMPO_FEEDBACK_COMMENTS).flatMap(
+    ([key, label]) => {
+      const count = counts[key as TempoFeedbackDetail] ?? 0;
+      return count > 0 ? [`${label} **${count}**`] : [];
+    },
+  );
+  const unclassified = Math.max(
+    0,
+    total - Object.values(counts).reduce((sum, n) => sum + (n ?? 0), 0),
+  );
+  if (unclassified)
+    lines.push(`テンポ：詳細未分類 **${unclassified}**（速い／遅いは未確認）`);
+  return lines;
+}
 
 export interface ExperienceContext {
   role: RoleName | "unknown";
