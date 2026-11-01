@@ -39,6 +39,8 @@ import {
 import { buildGameplayAnalyticsSummary } from "./match-analytics";
 import {
   experienceContext,
+  TEMPO_FEEDBACK_COMMENTS,
+  type TempoFeedbackDetail,
   NPC_FEEDBACK_DETAILS,
   type NpcFeedbackDetail,
 } from "./experience";
@@ -2623,6 +2625,16 @@ async function handleStart(
   try {
     await interaction.deferUpdate();
     await startGame(game);
+  } catch (error) {
+    if (["50001", "50013"].includes(diagnosticErrorCode(error))) {
+      await interaction.followUp({
+        content:
+          "開始画面を表示できませんでした。Botの「チャンネルを見る」「メッセージを送信」「埋め込みリンク」権限と、このチャンネルの上書き設定を確認してください。権限を直してから再度開始できます。",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    throw error;
   } finally {
     if (games.get(game.channelId) === game) game.starting = false;
   }
@@ -2786,6 +2798,32 @@ export function interruptedGameEmbed(
     });
 }
 
+export async function publishStartPanel(game: GameState): Promise<void> {
+  const payload = {
+    content: "",
+    embeds: [gameStartEmbed(game)],
+    components: [],
+  };
+  if (game.lobbyMessage) {
+    try {
+      await game.lobbyMessage.edit(payload);
+      return;
+    } catch (error) {
+      if (!["10008", "50001", "50005"].includes(diagnosticErrorCode(error)))
+        throw error;
+      recordGameDiagnostic(game, "error", {
+        source: "start_panel_edit",
+        code: diagnosticErrorCode(error),
+      });
+    }
+  }
+  // An old/deleted lobby message may be inaccessible while new sends still work.
+  // This is not a permission bypass: a failed send still aborts before role DMs.
+  const replacement = await game.channel.send(payload);
+  game.lobbyMessage = replacement;
+  recordGameDiagnostic(game, "start_panel_replaced");
+}
+
 async function startGame(game: GameState): Promise<void> {
   if (games.get(game.channelId) !== game) return;
   const hasPreparedRoles = game.players.every((player) => player.role);
@@ -2840,12 +2878,7 @@ async function startGame(game: GameState): Promise<void> {
   analyticsSnapshot(game);
   startGameDiagnostics(game);
   try {
-    if (!game.lobbyMessage) throw new Error("Lobby message is unavailable.");
-    await game.lobbyMessage.edit({
-      content: "",
-      embeds: [gameStartEmbed(game)],
-      components: [],
-    });
+    await publishStartPanel(game);
   } catch (error) {
     recordGameDiagnostic(game, "error", {
       source: "start_panel",
@@ -4237,7 +4270,7 @@ async function beginVoting(game: GameState): Promise<void> {
     components: [
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
-          .setCustomId(componentId("vote-open", game))
+          .setCustomId(componentId(`vote-open-${game.voteRound}`, game))
           .setLabel(game.voteRound > 1 ? "再投票する" : "投票する")
           .setEmoji("🗳️")
           .setStyle(ButtonStyle.Primary)
@@ -4572,11 +4605,13 @@ async function handleVoteOpen(
   interaction: ButtonInteraction,
   game: GameState,
   day: number,
+  round?: number,
 ): Promise<void> {
   const voter = activeHumanPlayer(game, interaction.user.id);
-  if (game.phase !== "voting" || game.resolving || game.day !== day || !voter) {
+  if (!isCurrentVoteRound(game, day, round) || !voter) {
     await interaction.reply({
-      content: "現在は投票できません。",
+      content:
+        "この投票画面の受付は終了しました。現在の投票パネルから開き直してください。",
       flags: MessageFlags.Ephemeral,
     });
     return;
@@ -4589,23 +4624,44 @@ async function handleVoteOpen(
     });
     return;
   }
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(componentId("vote", game))
-    .setPlaceholder(
-      game.voteRound > 1
-        ? "再投票先を選んでください"
-        : "処刑する相手、または処刑しないを選択",
-    )
-    .addOptions(options);
+  const menu = executionVoteMenu(game, voter);
   await interaction.reply({
-    content: game.votes.has(voter.id)
-      ? "投票先を変更できます。"
-      : "投票先を選んでください。",
+    content: `${game.voteRound > 1 ? "再投票" : "投票"}先を選んでください。**メニューを開くだけでは投票されません。**\n締切：${relativeTime(game.phaseEndsAt)}\n${game.votes.has(voter.id) ? "投票済みの票は、選び直すまで維持されます。" : "名前または「処刑しない」を選ぶと投票完了です。"}`,
     components: [
       new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu),
     ],
     flags: MessageFlags.Ephemeral,
   });
+}
+
+export function isCurrentVoteRound(
+  game: GameState,
+  day: number,
+  round: number | undefined,
+  now = Date.now(),
+): boolean {
+  return (
+    game.phase === "voting" &&
+    !game.resolving &&
+    game.day === day &&
+    round === game.voteRound &&
+    typeof game.phaseEndsAt === "number" &&
+    now < game.phaseEndsAt
+  );
+}
+
+export function executionVoteMenu(
+  game: GameState,
+  voter: Player,
+): StringSelectMenuBuilder {
+  return new StringSelectMenuBuilder()
+    .setCustomId(componentId(`vote-${game.voteRound}`, game))
+    .setPlaceholder(
+      game.voteRound > 1
+        ? "再投票先を選んでください"
+        : "処刑する相手、または処刑しないを選択",
+    )
+    .addOptions(executionVoteOptions(game, voter));
 }
 
 export function executionVoteOptions(game: GameState, voter: Player) {
@@ -4908,22 +4964,19 @@ async function handleSuspectReason(
   );
 }
 
-async function handleVote(
+export async function handleVote(
   interaction: StringSelectMenuInteraction,
   game: GameState,
   day: number,
+  round?: number,
 ): Promise<void> {
   const voter = game.players.find(
     (player) => player.id === interaction.user.id,
   );
-  if (
-    game.phase !== "voting" ||
-    game.resolving ||
-    game.day !== day ||
-    !voter?.alive
-  ) {
+  if (!isCurrentVoteRound(game, day, round) || !voter?.alive) {
     await interaction.reply({
-      content: "現在は投票できません。",
+      content:
+        "この投票画面の受付は終了しました。再投票では現在のパネルから選び直してください。",
       flags: MessageFlags.Ephemeral,
     });
     return;
@@ -4946,9 +4999,9 @@ async function handleVote(
   }
 
   game.votes.set(voter.id, targetId);
-  await interaction.reply({
+  await interaction.update({
     content: `**${targetId === NO_EXECUTION_VOTE ? "処刑しない" : safeName(game.players.find((player) => player.id === targetId)!)}**への投票を受け付けました。投票時間内なら変更できます。`,
-    flags: MessageFlags.Ephemeral,
+    components: [],
   });
   await updateVoteProgress(game);
 
@@ -7162,6 +7215,24 @@ export function npcFeedbackDetailRows(
   ];
 }
 
+export function tempoFeedbackDetailRows(
+  game: GameState,
+  rating: DetailedFeedbackRating,
+): ActionRowBuilder<ButtonBuilder>[] {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      Object.entries(TEMPO_FEEDBACK_COMMENTS).map(([key, text]) =>
+        new ButtonBuilder()
+          .setCustomId(
+            feedbackComponentId(`feedback-tempo-${rating}-${key}`, game),
+          )
+          .setLabel(text.replace("テンポ：", ""))
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    ),
+  ];
+}
+
 function feedbackParticipant(game: GameState, userId: string): boolean {
   if (game.analyticsFeedbackEligibleUserIds)
     return game.analyticsFeedbackEligibleUserIds.has(userId);
@@ -7249,12 +7320,13 @@ async function handleFeedbackButton(
   await interaction.editReply({ content });
 }
 
-async function handleFeedbackReason(
+export async function handleFeedbackReason(
   interaction: ButtonInteraction,
   game: GameState,
   rating: DetailedFeedbackRating,
   reason: FeedbackReason,
   npcDetail?: NpcFeedbackDetail,
+  tempoDetail?: TempoFeedbackDetail,
 ): Promise<void> {
   if (!feedbackParticipant(game, interaction.user.id)) {
     await interaction.reply({
@@ -7277,6 +7349,13 @@ async function handleFeedbackReason(
       content:
         "NPCのどの点が気になりましたか？ 1つ選ぶと送信します。詳しく選ばず送ることもできます。",
       components: npcFeedbackDetailRows(game, rating),
+    });
+    return;
+  }
+  if (reason === "tempo" && !tempoDetail) {
+    await interaction.update({
+      content: "テンポは、どちらが気になりましたか？ 1つ選ぶと送信します。",
+      components: tempoFeedbackDetailRows(game, rating),
     });
     return;
   }
@@ -7304,7 +7383,7 @@ async function handleFeedbackReason(
     interaction.user.id,
     rating,
     reason,
-    undefined,
+    tempoDetail ? TEMPO_FEEDBACK_COMMENTS[tempoDetail] : undefined,
     npcDetail,
   );
   await interaction.editReply({ content, components: [] });
@@ -7578,6 +7657,26 @@ export async function handleComponent(
   }
 
   if (interaction.isButton()) {
+    const tempoFeedbackDetail =
+      /^feedback-tempo-(neutral|issue)-(fast|slow|unspecified)$/.exec(action);
+    if (tempoFeedbackDetail) {
+      if (dayText !== game.analyticsChainId) {
+        await interaction.reply({
+          content: "この連戦の感想受付は終了しました。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      await handleFeedbackReason(
+        interaction,
+        game,
+        tempoFeedbackDetail[1] as DetailedFeedbackRating,
+        "tempo",
+        undefined,
+        tempoFeedbackDetail[2] as TempoFeedbackDetail,
+      );
+      return;
+    }
     const npcFeedbackDetail =
       /^feedback-npc-(neutral|issue)-(unfair|inconsistent|unresponsive|repetitive|unspecified)$/.exec(
         action,
@@ -7658,8 +7757,13 @@ export async function handleComponent(
       await handleSuspectOpen(interaction, game, Number(dayText));
     else if (action === "npc-question-open")
       await handleNpcQuestionOpen(interaction, game, Number(dayText));
-    else if (action === "vote-open")
-      await handleVoteOpen(interaction, game, Number(dayText));
+    else if (action === "vote-open" || /^vote-open-[12]$/.test(action))
+      await handleVoteOpen(
+        interaction,
+        game,
+        Number(dayText),
+        action === "vote-open" ? undefined : Number(action.slice(-1)),
+      );
     else if (action === "wolf-chat-open")
       await handleWolfChatOpen(interaction, game, Number(dayText));
     else if (action === "start") await handleStart(interaction, game);
@@ -7704,7 +7808,13 @@ export async function handleComponent(
     await handleSuspectReason(interaction, game, day);
   else if (action === "npc-question")
     await handleNpcQuestion(interaction, game, day);
-  else if (action === "vote") await handleVote(interaction, game, day);
+  else if (action === "vote" || /^vote-[12]$/.test(action))
+    await handleVote(
+      interaction,
+      game,
+      day,
+      action === "vote" ? undefined : Number(action.slice(-1)),
+    );
   else if (action === "opening-cupid")
     await handleOpeningAction(interaction, game, "cupid", day);
   else if (action === "opening-devotee")

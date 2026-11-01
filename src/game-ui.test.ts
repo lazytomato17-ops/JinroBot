@@ -1,4 +1,10 @@
-import { ChannelType, type Guild, type TextChannel } from "discord.js";
+import {
+  ChannelType,
+  type Guild,
+  type TextChannel,
+  type Message,
+  type StringSelectMenuInteraction,
+} from "discord.js";
 import { describe, expect, it, vi } from "vitest";
 import {
   abandonReasonFromAction,
@@ -91,6 +97,13 @@ import {
 import { roleConfigFromRoles } from "./roles";
 import { NO_EXECUTION_VOTE, resolveVoteOutcome } from "./presentation";
 import { executionVoteOptions, isValidExecutionVote } from "./game";
+import {
+  executionVoteMenu,
+  isCurrentVoteRound,
+  publishStartPanel,
+  tempoFeedbackDetailRows,
+  handleVote,
+} from "./game";
 import { buildSoloRoles, chooseNpcVoteTarget } from "./solo";
 import type { GameState, Player, RoleName } from "./types";
 
@@ -148,6 +161,95 @@ function enableBetaHost(game: GameState): void {
 }
 
 describe("ゲーム画面", () => {
+  it("通常投票と再投票のメニューを別IDにし、前ラウンド・締切後は拒否する", () => {
+    const game = makeGame();
+    game.phase = "voting";
+    game.phaseEndsAt = Date.now() + 10000;
+    expect(
+      executionVoteMenu(game, game.players[0]).toJSON().custom_id,
+    ).toContain("tb:vote-1:");
+    expect(isCurrentVoteRound(game, 1, 1)).toBe(true);
+    game.voteRound = 2;
+    expect(
+      executionVoteMenu(game, game.players[0]).toJSON().custom_id,
+    ).toContain("tb:vote-2:");
+    expect(isCurrentVoteRound(game, 1, 1)).toBe(false);
+    expect(isCurrentVoteRound(game, 1, undefined)).toBe(false);
+    expect(isCurrentVoteRound(game, 2, 2)).toBe(false);
+    expect(isCurrentVoteRound(game, 1, 2, game.phaseEndsAt)).toBe(false);
+    game.resolving = true;
+    expect(isCurrentVoteRound(game, 1, 2)).toBe(false);
+  });
+  it("古い投票メニューから再投票へ票を流し込まない", async () => {
+    const game = makeGame();
+    game.phase = "voting";
+    game.voteRound = 2;
+    game.phaseEndsAt = Date.now() + 10000;
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const update = vi.fn().mockResolvedValue(undefined);
+    const interaction = {
+      user: { id: "0" },
+      values: ["1"],
+      reply,
+      update,
+    } as unknown as StringSelectMenuInteraction;
+    await handleVote(interaction, game, 1, 1);
+    expect(game.votes.size).toBe(0);
+    expect(reply).toHaveBeenCalledTimes(1);
+    await handleVote(interaction, game, 1, 2);
+    expect(game.votes.get("0")).toBe("1");
+    expect(update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        components: [],
+        content: expect.stringContaining("投票を受け付けました"),
+      }),
+    );
+  });
+  it("古い開始メッセージの編集失敗では新規送信を試し、送信成功時だけ置き換える", async () => {
+    for (const code of [10008, 50001, 50005]) {
+      const game = makeGame();
+      game.lobbyMessage = {
+        edit: vi.fn().mockRejectedValue({ code }),
+      } as unknown as Message;
+      const replacement = { id: "new" } as Message;
+      const send = vi.fn().mockResolvedValue(replacement);
+      game.channel = { send } as unknown as TextChannel;
+      await publishStartPanel(game);
+      expect(game.lobbyMessage).toBe(replacement);
+      expect(send).toHaveBeenCalledTimes(1);
+    }
+  });
+  it("本当にチャンネルへ送れない開始失敗と、不明な編集エラーを成功扱いしない", async () => {
+    const game = makeGame();
+    const old = {
+      edit: vi.fn().mockRejectedValue({ code: 50001 }),
+    } as unknown as Message;
+    game.lobbyMessage = old;
+    const send = vi.fn().mockRejectedValue({ code: 50001 });
+    game.channel = { send } as unknown as TextChannel;
+    await expect(publishStartPanel(game)).rejects.toEqual({ code: 50001 });
+    expect(game.lobbyMessage).toBe(old);
+    old.edit = vi.fn().mockRejectedValue(new Error("network"));
+    send.mockClear();
+    await expect(publishStartPanel(game)).rejects.toThrow("network");
+    expect(send).not.toHaveBeenCalled();
+  });
+  it("テンポの詳細は非公開導線内の3択で、ID上限内", () => {
+    const game = makeGame();
+    game.channelId = "12345678901234567890";
+    game.analyticsChainId = "01234567-0123-0123-0123-012345678901";
+    const rows = tempoFeedbackDetailRows(game, "neutral").map((r) =>
+      r.toJSON(),
+    );
+    expect(rows[0].components.map((c) => c.label)).toEqual([
+      "進行が速すぎる",
+      "待ち時間が長い",
+      "詳しくは選ばず送信",
+    ]);
+    expect(
+      rows[0].components.every((c) => (c.custom_id?.length ?? 101) <= 100),
+    ).toBe(true);
+  });
   it("15人でも自分以外と処刑しないを1メニューに収め、再投票は同票候補だけ", () => {
     const game = makeGame(Array<RoleName>(15).fill("村人"));
     game.voteCandidateIds.push(NO_EXECUTION_VOTE);

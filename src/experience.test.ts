@@ -5,8 +5,20 @@ import {
   experienceContext,
 } from "./experience";
 import type { GameState } from "./types";
+import { tempoFeedbackLines } from "./experience";
 
 describe("体験の内訳", () => {
+  it("テンポは速い・遅い・未分類を分離し、旧回答の方向を決めつけない", () => {
+    const lines = tempoFeedbackLines(4, {
+      fast: 1,
+      slow: 1,
+      unspecified: 1,
+    }).join("\n");
+    expect(lines).toContain("進行が速すぎる **1**");
+    expect(lines).toContain("待ち時間が長い **1**");
+    expect(lines).toContain("詳細未分類 **1**（速い／遅いは未確認）");
+    expect(tempoFeedbackLines(0, {})).toEqual([]);
+  });
   it("回答者内の分母と、旧形式の未計測を分離する", () => {
     const lines = buildExperienceFeedbackLines([
       {
