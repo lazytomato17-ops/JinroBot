@@ -131,7 +131,7 @@ const MIN_PLAYERS = 4;
 const MAX_PLAYERS = 15;
 const NPC_QUESTIONS_PER_DAY = 2;
 const WOLF_CHAT_MESSAGES_PER_NIGHT = 2;
-const ABANDON_REASON_WINDOW_MS = 10 * 60 * 1000;
+const ABANDON_REASON_WINDOW_MS = 10 * 120 * 1000;
 const LOQUACIOUS_WORDS = [
   "投票",
   "占い",
@@ -7141,7 +7141,7 @@ async function endGame(game: GameState, winner: Winner): Promise<void> {
     });
   }
 
-  schedule(game, 10 * 60 * 1000, () => {
+  schedule(game, 10 * 120 * 1000, () => {
     if (games.get(game.channelId) !== game) return;
     games.delete(game.channelId);
     void game.phaseMessage?.edit({ components: [] }).catch(() => undefined);
