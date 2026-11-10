@@ -1,9 +1,10 @@
 # April 17 JinroBot release
 
 Gameplay and NPC voting come from `b2c12fa`. The original Rust engine is built
-as a locked N-API module. Ranked rating uses the April formula and a 1–3 point
-random adjustment. Ghost bets change rating by 4 or 10 points on a hit, with a
-maximum net +2 for a losing player. There is no TP.
+as a locked N-API module. Ranked rating uses the May 14 `33011bd` arithmetic
+with a 1–5 point random adjustment. A correct ghost bet adds 5 or 10 points
+for a winner, or offsets 12 or 20 points for a loser (maximum net +3). April
+role and win rules still decide who won. There is no TP.
 
 The existing Discord slash commands, Supabase access configuration, and opt-in
 website ranking are retained. No migration or rating reset is needed. The old

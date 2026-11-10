@@ -17,6 +17,7 @@ let readyCallback;
 const jobs = [];
 const reads = [];
 const writes = [];
+let storedRatings = [];
 process.env.SUPABASE_URL = "https://offline.invalid";
 process.env.SUPABASE_SECRET_KEY = "not-a-real-key";
 class OfflineClient extends EventEmitter {
@@ -51,7 +52,7 @@ Module._load = function (name, ...args) {
           select(columns, options) {
             reads.push(table);
             if (options?.head) return { async limit() { return { error: null }; } };
-            if (table === "users") return { async in() { return { data: [] }; } };
+            if (table === "users") return { async in() { return { data: storedRatings }; } };
             if (table === "system_settings") return { eq() { return { async single() { return { data: { value: 1 } }; } }; } };
             assert.fail(`Unexpected read: ${table}.${columns}`);
           },
@@ -85,7 +86,7 @@ net.Socket.prototype.connect = function () { assert.fail("Network connection att
   assert.deepEqual(writes, []);
   await health({}, {
     writeHead(status) { assert.equal(status, 200); },
-    end(body) { assert.match(body, /JinroBot legacy b2c12fa ready/); },
+    end(body) { assert.equal(body, "JinroBot legacy b2c12fa / rating 33011bd ready"); },
   });
   await health({ url: "/api/rankings", method: "GET" }, {
     setHeader() {},
@@ -130,26 +131,32 @@ net.Socket.prototype.connect = function () { assert.fail("Network connection att
   assert.equal(receipt.ephemeral, true);
   const rating = (team, people, stats, isRanked = true) => predictRatingChange(team, people, [], { isRanked }, null, stats);
   Math.random = () => 0;
-  const low = await rating("villager", [winner, loser], {});
+  const low = await rating("villager", [{ ...winner, ghostBet: undefined }, loser], {});
   Math.random = () => 0.99;
-  const high = await rating("villager", [winner, loser], {});
-  assert.equal(high[winner.id] - low[winner.id], 2);
+  const high = await rating("villager", [{ ...winner, ghostBet: undefined }, loser], {});
+  assert.equal(low[winner.id], 26);
+  assert.equal(high[winner.id], 30);
   Math.random = () => 0.5;
   const baseline = await rating("villager", [{ ...winner, ghostBet: undefined }, loser], {});
   const hit = await rating("villager", [winner, { ...loser, ghostBet: "villager" }], {});
-  assert.equal(hit[winner.id] - baseline[winner.id], 4);
-  assert.equal(hit[loser.id], Math.min(baseline[loser.id] + 4, 2));
+  assert.equal(hit[winner.id] - baseline[winner.id], 5);
+  assert.equal(hit[loser.id], Math.min(baseline[loser.id] + 12, 3));
   const fox = { ...winner, role: "妖狐", ghostBet: "other" };
   const foxBase = await rating("fox", [{ ...fox, ghostBet: undefined }, loser], {});
   const foxHit = await rating("fox", [fox, { ...loser, ghostBet: "other" }], {});
   assert.equal(foxHit[fox.id] - foxBase[fox.id], 10);
-  assert.equal(foxHit[loser.id], Math.min(foxBase[loser.id] + 10, 2));
+  assert.equal(foxHit[loser.id], Math.min(foxBase[loser.id] + 20, 3));
   assert.deepEqual(await rating("villager", [winner, loser], {}, false), {});
   assert.deepEqual(Object.keys(hit).sort(), [winner.id, loser.id].sort());
   game.players = [winner, { ...loser, ghostBet: "villager" }];
-  assert.deepEqual((await saveGameResults(game, "villager", null)).deltas, hit);
+  storedRatings = [{ id: winner.id, rate: 1712, streak: 4 }, { id: loser.id, rate: 1665, streak: 1 }];
+  const existing = Object.fromEntries(storedRatings.map(row => [row.id, row]));
+  const expected = await rating("villager", game.players, existing);
+  const withoutBet = await rating("villager", [winner, loser], existing);
+  assert.equal(expected[loser.id] - withoutBet[loser.id], 12);
+  assert.deepEqual((await saveGameResults(game, "villager", null)).deltas, expected);
   assert.deepEqual(writes.map(({ table }) => table), ["matches", "users", "match_players"]);
-  assert.equal(writes[1].rows[0].rate, 1500 + hit[winner.id]);
-  assert.equal(writes[2].rows[0].rate_delta, hit[winner.id]);
-  console.log("PASS: April Rust NPC vote, offline startup, April random rating and ghost-bet rules, and no TP.");
+  assert.equal(writes[1].rows[0].rate, 1712 + expected[winner.id]);
+  assert.equal(writes[2].rows[0].rate_delta, expected[winner.id]);
+  console.log("PASS: April Rust NPC vote, May rating and ghost-bet rules, existing ratings, and no TP.");
 })().catch((error) => { console.error(error); process.exitCode = 1; });
