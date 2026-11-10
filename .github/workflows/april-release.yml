@@ -1,7 +1,7 @@
-name: April runtime
+name: Production runtime
 on:
   pull_request:
-    paths: [Dockerfile, 'april/**', 'legacy/package*.json', 'src/ranking.ts', '.github/workflows/april-release.yml']
+    paths: [Dockerfile, 'april/**', 'legacy/**', 'src/ranking.ts', '.github/workflows/april-release.yml']
 permissions:
   contents: read
 jobs:

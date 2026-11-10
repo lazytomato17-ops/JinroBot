@@ -54,7 +54,7 @@ http.createServer(async (req, res) => {
     }
     const ready = startupReady && client.isReady();
     res.writeHead(ready ? 200 : 503, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end(ready ? 'JinroBot legacy 33011bd ready' : 'JinroBot starting');
+    res.end(ready ? 'JinroBot legacy 33011bd / rating b2c12fa ready' : 'JinroBot starting');
 }).listen(port, () => console.log(`🌐 ヘルスチェックサーバーがポート ${port} で起動しました！`));
 
 process.on('unhandledRejection', r => console.error('🚨 UnhandledRejection:', r));
@@ -85,7 +85,7 @@ client.once('ready', async () => {
         await DB.checkLegacyStorage();
         await client.application!.commands.set(commands);
         startupReady = true;
-        console.log('[legacy 33011bd] Discord commands and existing rating storage ready');
+        console.log('[legacy 33011bd / rating b2c12fa] Discord commands and existing rating storage ready');
     } catch (error) {
         console.error('[legacy 33011bd] startup failed:', error);
     }
