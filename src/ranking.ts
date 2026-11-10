@@ -51,7 +51,7 @@ export type PublicRankingResult =
 let cachedClient: SupabaseClient | null | undefined;
 let warnedAboutMissingConfig = false;
 
-const timedFetch: typeof fetch = async (input, init = {}) => {
+const timedFetch: typeof fetch = async (input, init: RequestInit = {}) => {
   const controller = new AbortController();
   const upstreamSignal = init.signal;
   const forwardAbort = () => controller.abort(upstreamSignal?.reason);

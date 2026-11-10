@@ -4,6 +4,7 @@
 node_modules/
 dist/
 coverage/
+april/tomatobot-core/target/
 supabase/.temp/
 *.log
 .DS_Store
