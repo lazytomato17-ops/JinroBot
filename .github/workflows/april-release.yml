@@ -1,0 +1,13 @@
+name: April runtime
+on:
+  pull_request:
+    paths: [Dockerfile, 'april/**', 'legacy/package*.json', 'src/ranking.ts', '.github/workflows/april-release.yml']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test production image
+        run: docker build .
